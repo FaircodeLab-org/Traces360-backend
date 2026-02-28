@@ -321,13 +321,25 @@ def create_request(supplier_id, request_type, message=None, purchase_order_numbe
                 print(f"⚠️ Custom field 'purchase_order_number' not found, storing in message")
 
         # Handle requested products if provided
-        if requested_products and isinstance(requested_products, (list, str)):
-            if isinstance(requested_products, str):
-                doc.requested_products = requested_products
-            else:
-                # Convert list to JSON string
-                import json
-                doc.requested_products = json.dumps(requested_products)
+        items = _as_list(requested_products)
+        if items and doc.meta.get_field("requested_products"):
+            for it in items:
+                if isinstance(it, dict):
+                    item_code = it.get("item_code") or it.get("productCode") or it.get("itemCode") or it.get("id") or it.get("name")
+                    qty = it.get("qty") or it.get("quantity")
+                    uom = it.get("uom")
+                else:
+                    item_code = it
+                    qty = None
+                    uom = None
+                if not item_code:
+                    continue
+                row = doc.append("requested_products", {})
+                row.item_code = item_code
+                if qty is not None:
+                    row.qty = qty
+                if uom:
+                    row.uom = uom
 
         # Save the document
         doc.insert(ignore_permissions=True)
@@ -1225,13 +1237,16 @@ def get_purchase_order_details(request_id):
             filters={"supplier": supplier},
             fields=["name as id", "plot_id", "plot_name", "area", "country", "commodities"]
         )
+        items = frappe.get_all(
+            "Item",
+            filters={"item_group": "EUDR Commodities", "disabled": 0},
+            fields=["name", "item_name", "item_group"],
+            order_by="item_name asc"
+        )
 
         products = [
-            {"id": "1", "name": "Coffee Arabica", "category": "Coffee"},
-            {"id": "2", "name": "Coffee Robusta", "category": "Coffee"},
-            {"id": "3", "name": "Cocoa Beans", "category": "Cocoa"},
-            {"id": "4", "name": "Palm Oil", "category": "Oil"},
-            {"id": "5", "name": "Cardamom", "category": "Spice"}
+            {"id": i.name, "name": i.item_name or i.name, "category": i.item_group}
+            for i in items
         ]
 
         return {
@@ -1282,6 +1297,44 @@ def submit_purchase_order_data(request_id, po_data):
         
         request_doc.responded_by = user
         request_doc.save(ignore_permissions=True)
+
+        # Create Batch records for selected products (if provided)
+        try:
+            batches = po_data.get("batches") or []
+            product_ids = po_data.get("products") or []
+
+            for batch in batches:
+                batch_no = batch.get("batchNumber") or batch.get("batch_id")
+                expiry_date = batch.get("validityDate") or batch.get("expiry_date")
+                manufacturing_date = batch.get("manufacturingDate") or batch.get("manufacturing_date")
+
+                if not batch_no:
+                    continue
+
+                for product_id in product_ids:
+                    if not product_id:
+                        continue
+
+                    target_batch_id = batch_no
+                    existing_item = frappe.db.get_value("Batch", {"batch_id": target_batch_id}, "item")
+
+                    if existing_item and existing_item != product_id:
+                        target_batch_id = f"{batch_no}-{product_id}"
+
+                    if frappe.db.exists("Batch", {"batch_id": target_batch_id}):
+                        continue
+
+                    batch_doc = frappe.get_doc({
+                        "doctype": "Batch",
+                        "item": product_id,
+                        "batch_id": target_batch_id,
+                        "expiry_date": expiry_date,
+                        "manufacturing_date": manufacturing_date,
+                    })
+                    batch_doc.insert(ignore_permissions=True)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "PO Batch Create Error")
+
         frappe.db.commit()
 
         return {
@@ -1353,17 +1406,17 @@ def get_purchase_order_response(request_id):
         # Get detailed product information  
         detailed_products = []
         if po_data.get("products"):
-            # Since products are currently mock data, we'll return them as-is
-            # In a real system, you'd query a Product doctype
             product_ids = po_data["products"]
-            mock_products = [
-                {"id": "1", "name": "Coffee Arabica", "category": "Coffee"},
-                {"id": "2", "name": "Coffee Robusta", "category": "Coffee"}, 
-                {"id": "3", "name": "Cocoa Beans", "category": "Cocoa"},
-                {"id": "4", "name": "Palm Oil", "category": "Oil"},
-                {"id": "5", "name": "Cardamom", "category": "Spice"}
+            items = frappe.get_all(
+                "Item",
+                filters={"name": ["in", product_ids]},
+                fields=["name", "item_name", "item_group"]
+            )
+            item_map = {i.name: i for i in items}
+            detailed_products = [
+                {"id": pid, "name": item_map[pid].item_name or pid, "category": item_map[pid].item_group}
+                for pid in product_ids if pid in item_map
             ]
-            detailed_products = [p for p in mock_products if p["id"] in product_ids]
 
         # Calculate summary statistics
         total_plots = len(detailed_plots)
