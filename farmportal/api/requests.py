@@ -1104,23 +1104,25 @@ def get_risk_dashboard_data():
                                 "status": request.status
                             })
                             existing_plot["total_shares"] += 1
-                            
+
+                            # Always refresh mitigation & risk flags (independent of request date)
+                            existing_plot["risk_level"] = risk_level
+                            existing_plot["mitigated"] = plot.get("mitigated")
+                            existing_plot["mitigation_note"] = plot.get("mitigation_note")
+                            existing_plot["mitigation_on"] = plot.get("mitigation_on")
+                            existing_plot["mitigation_by"] = plot.get("mitigation_by")
+                            existing_plot["plot_name"] = plot_label
+
                             # Update with latest data if this request is more recent
                             if request.creation > existing_plot["last_shared_date"]:
                                 existing_plot.update({
                                     "plot_id": plot.get("plot_id"),
-                                    "plot_name": plot_label,
                                     "country": plot.get("country"),
                                     "area": plot.get("area", 0),
                                     "deforestation_percentage": plot.get("deforestation_percentage", 0),
                                     "deforested_area": plot.get("deforested_area", 0),
                                     "commodities": plot.get("commodities"),
                                     "coordinates": plot.get("coordinates"),
-                                    "risk_level": risk_level,
-                                    "mitigated": plot.get("mitigated"),
-                                    "mitigation_note": plot.get("mitigation_note"),
-                                    "mitigation_on": plot.get("mitigation_on"),
-                                    "mitigation_by": plot.get("mitigation_by"),
                                     "last_shared_date": request.creation,
                                     "latest_request_id": request.name
                                 })
@@ -1137,6 +1139,10 @@ def get_risk_dashboard_data():
                                 "commodities": plot.get("commodities"),
                                 "coordinates": plot.get("coordinates"),
                                 "risk_level": risk_level,
+                                "mitigated": plot.get("mitigated"),
+                                "mitigation_note": plot.get("mitigation_note"),
+                                "mitigation_on": plot.get("mitigation_on"),
+                                "mitigation_by": plot.get("mitigation_by"),
                                 "shared_in_requests": [{
                                     "request_id": request.name,
                                     "request_date": request.creation,
