@@ -1484,18 +1484,26 @@ def submit_purchase_order_data(request_id, po_data):
                     if not product_id:
                         continue
 
+                    # Resolve Item name (Batch.item links to Item.name)
+                    item_name = product_id
+                    if not frappe.db.exists("Item", item_name):
+                        item_name = frappe.db.get_value("Item", {"item_code": product_id}, "name") or item_name
+
+                    if not frappe.db.exists("Item", item_name):
+                        continue
+
                     target_batch_id = batch_no
                     existing_item = frappe.db.get_value("Batch", {"batch_id": target_batch_id}, "item")
 
-                    if existing_item and existing_item != product_id:
-                        target_batch_id = f"{batch_no}-{product_id}"
+                    if existing_item and existing_item != item_name:
+                        target_batch_id = f"{batch_no}-{item_name}"
 
                     if frappe.db.exists("Batch", {"batch_id": target_batch_id}):
                         continue
 
                     batch_doc = frappe.get_doc({
                         "doctype": "Batch",
-                        "item": product_id,
+                        "item": item_name,
                         "batch_id": target_batch_id,
                         "expiry_date": expiry_date,
                         "manufacturing_date": manufacturing_date,
