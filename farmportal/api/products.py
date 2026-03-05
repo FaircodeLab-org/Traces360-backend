@@ -38,13 +38,15 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
             order_by="modified desc",
         )
 
+        item_names = [i["name"] for i in items if i.get("name")]
         item_codes = [i["item_code"] for i in items if i.get("item_code")]
+        lookup_ids = list({*item_names, *item_codes})
         batches_by_item = {}
-        if item_codes:
+        if lookup_ids:
             batch_rows = frappe.get_all(
                 "Batch",
                 fields=["name", "batch_id", "item", "expiry_date", "manufacturing_date"],
-                filters={"item": ["in", item_codes]},
+                filters={"item": ["in", lookup_ids]},
                 order_by="creation desc",
                 limit_page_length=5000,
             )
@@ -57,7 +59,7 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
                 })
 
         for it in items:
-            it["batches"] = batches_by_item.get(it.get("item_code"), [])
+            it["batches"] = batches_by_item.get(it.get("name")) or batches_by_item.get(it.get("item_code"), [])
 
         return {
             "message": f"Fetched {len(items)} EUDR Commodities products",
@@ -161,14 +163,16 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
     )
 
     # collect item codes to fetch batches in one shot
+    item_names = [i["name"] for i in items if i.get("name")]
     item_codes = [i["item_code"] for i in items if i.get("item_code")]
+    lookup_ids = list({*item_names, *item_codes})
     batches_by_item: Dict[str, List[Dict]] = {}
 
-    if item_codes:
+    if lookup_ids:
         batch_rows = frappe.get_all(
             "Batch",
             fields=["name", "batch_id", "item", "expiry_date", "manufacturing_date"],
-            filters={"item": ["in", item_codes]},
+            filters={"item": ["in", lookup_ids]},
             order_by="creation desc",
             limit_page_length=5000,
         )
@@ -181,7 +185,7 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
             })
 
     for it in items:
-        it["batches"] = batches_by_item.get(it.get("item_code"), [])
+        it["batches"] = batches_by_item.get(it.get("name")) or batches_by_item.get(it.get("item_code"), [])
 
     return {
         "message": f"Fetched {len(items)} requested products",
