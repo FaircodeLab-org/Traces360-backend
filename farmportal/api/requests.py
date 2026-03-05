@@ -1492,6 +1492,11 @@ def submit_purchase_order_data(request_id, po_data):
                     if not frappe.db.exists("Item", item_name):
                         continue
 
+                    # Ensure item allows batch tracking (ERPNext validation)
+                    has_batch = frappe.db.get_value("Item", item_name, "has_batch_no")
+                    if has_batch in (0, "0", None):
+                        frappe.db.set_value("Item", item_name, "has_batch_no", 1, update_modified=False)
+
                     target_batch_id = batch_no
                     existing_item = frappe.db.get_value("Batch", {"batch_id": target_batch_id}, "item")
 
