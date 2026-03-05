@@ -671,21 +671,28 @@ def get_supplier_land_plots():
 
     try:
         # Get land plots for this supplier - REMOVED 'products' field
+        plot_meta = frappe.get_meta("Land Plot")
+        has_plot_id = plot_meta.has_field("plot_id")
+        name_field = "farmer_name" if plot_meta.has_field("farmer_name") else ("plot_name" if plot_meta.has_field("plot_name") else None)
+
+        fields = [
+            "name as id",
+            "country",
+            "area",
+            "coordinates",
+            "commodities",  # This field exists
+            "deforestation_percentage",
+            "deforested_area"
+        ]
+        if has_plot_id:
+            fields.insert(1, "plot_id")
+        if name_field:
+            fields.insert(2 if has_plot_id else 1, f"{name_field} as plot_name")
+
         plots = frappe.get_all(
             "Land Plot",
             filters={"supplier": supplier, "docstatus": ["!=", 2]},
-            fields=[
-                "name as id",
-                "plot_id",
-                "plot_name", 
-                "country",
-                "area",
-                "coordinates",
-                "commodities",  # This field exists
-                "deforestation_percentage",
-                "deforested_area"
-                # REMOVED 'products' - doesn't exist in doctype
-            ],
+            fields=fields,
             order_by="creation desc",
             limit_page_length=500
         )
@@ -1002,14 +1009,18 @@ def get_risk_dashboard_data():
             SELECT 
                 r.name,
                 r.supplier,
+                r.request_type,
                 r.shared_plots_json,
+                r.purchase_order_data,
                 r.status,
                 r.creation,
                 r.response_message
             FROM `tabRequest` r
             WHERE r.customer = %s 
-            AND r.shared_plots_json IS NOT NULL 
-            AND r.shared_plots_json != ''
+            AND (
+                (r.shared_plots_json IS NOT NULL AND r.shared_plots_json != '')
+                OR (r.purchase_order_data IS NOT NULL AND r.purchase_order_data != '')
+            )
             ORDER BY r.creation DESC
         """, (customer,), as_dict=True)
 
@@ -1043,18 +1054,52 @@ def get_risk_dashboard_data():
                     "status": "active"
                 }
             
-            # Parse shared plots
+            # Parse shared plots (land plot requests + purchase order responses)
             try:
-                plot_ids = json.loads(request.shared_plots_json)
-                
+                plot_ids = []
+
+                if request.shared_plots_json:
+                    parsed = json.loads(request.shared_plots_json) if isinstance(request.shared_plots_json, str) else request.shared_plots_json
+                    if isinstance(parsed, list):
+                        plot_ids.extend(parsed)
+
+                if request.purchase_order_data:
+                    try:
+                        po_data = json.loads(request.purchase_order_data) if isinstance(request.purchase_order_data, str) else request.purchase_order_data
+                        po_plots = (
+                            po_data.get("selected_plots")
+                            or po_data.get("selectedPlots")
+                            or po_data.get("plots")
+                            or []
+                        )
+                        # Normalize list payloads (could be list of objects or JSON string)
+                        if isinstance(po_plots, str):
+                            try:
+                                po_plots = json.loads(po_plots)
+                            except Exception:
+                                po_plots = [p.strip() for p in po_plots.split(',') if p.strip()]
+                        if isinstance(po_plots, list) and po_plots and isinstance(po_plots[0], dict):
+                            po_plots = [p.get("id") or p.get("plot_id") or p.get("name") for p in po_plots]
+                            po_plots = [p for p in po_plots if p]
+                        plot_ids.extend(po_plots or [])
+                    except Exception:
+                        pass
+
+                # Deduplicate while preserving order
+                seen = set()
+                plot_ids = [p for p in plot_ids if p and not (p in seen or seen.add(p))]
+
                 # Get plot details
                 if plot_ids:
                     plot_meta = frappe.get_meta("Land Plot")
+                    has_plot_id = plot_meta.has_field("plot_id")
                     plot_fields = [
-                        "name", "plot_id", "country", "area",
+                        "name", "country", "area",
                         "deforestation_percentage", "deforested_area", 
                         "commodities", "coordinates"
                     ]
+                    if has_plot_id:
+                        plot_fields.insert(1, "plot_id")
                     if plot_meta.has_field("farmer_name"):
                         plot_fields.append("farmer_name")
                     if plot_meta.has_field("plot_name"):
@@ -1072,6 +1117,11 @@ def get_risk_dashboard_data():
                         filters={"name": ["in", plot_ids]},
                         fields=plot_fields
                     )
+                    if not plots and has_plot_id:
+                        plots = frappe.get_all("Land Plot", 
+                            filters={"plot_id": ["in", plot_ids]},
+                            fields=plot_fields
+                        )
                     
                     for plot in plots:
                         plot_unique_id = plot["name"]  # Use plot name as unique identifier
@@ -1156,7 +1206,7 @@ def get_risk_dashboard_data():
                             
             except Exception as e:
                 print(f"Error parsing shared plots for request {request.name}: {str(e)}")
-            
+
             suppliers_data[supplier_name]["requests"].append({
                 "id": request.name,
                 "status": request.status,
