@@ -3,7 +3,7 @@
 import json
 import frappe
 from frappe import _
-from frappe.utils import now_datetime
+from frappe.utils import now_datetime, get_datetime
 
 DT = "Request"
 
@@ -1083,6 +1083,18 @@ def get_risk_dashboard_data():
         if not customer:
             return {"suppliers": [], "summary": {}}
 
+        # Risk analysis state: keep a per-customer set of already analyzed plot names.
+        analyzed_plots_cache_key = f"risk_analyzed_plots::{customer}"
+        analyzed_plots_raw = frappe.cache().get_value(analyzed_plots_cache_key)
+        analyzed_plot_names = set()
+        if analyzed_plots_raw:
+            try:
+                parsed = json.loads(analyzed_plots_raw) if isinstance(analyzed_plots_raw, str) else analyzed_plots_raw
+                if isinstance(parsed, list):
+                    analyzed_plot_names = {str(p).strip() for p in parsed if p}
+            except Exception:
+                analyzed_plot_names = set()
+
         # Get all requests for this customer with shared plots
         requests_with_plots = frappe.db.sql("""
             SELECT 
@@ -1297,51 +1309,69 @@ def get_risk_dashboard_data():
             total_plots = len(unique_plots_list)
             
             # Reset counters
-            data["total_area"] = 0
+            data["total_area"] = sum([(plot.get("area") or 0) for plot in unique_plots_list])
             data["total_deforestation"] = 0
             data["high_risk_plots"] = 0
             data["medium_risk_plots"] = 0
             data["low_risk_plots"] = 0
+            data["pending_plots"] = 0
+            analyzed_plots = []
+
+            # Plot-level analysis status:
+            # keep already analyzed plots visible, and mark only new plot names as pending.
+            for plot in unique_plots_list:
+                plot_name = str(plot.get("name") or "").strip()
+                plot_analysis_required = not plot_name or plot_name not in analyzed_plot_names
+                plot["analysis_required"] = bool(plot_analysis_required)
+
+                if plot_analysis_required:
+                    plot["risk_level"] = "not_analyzed"
+                    plot["deforestation_percentage"] = None
+                    plot["deforested_area"] = None
+                    data["pending_plots"] += 1
+                    continue
+
+                analyzed_plots.append(plot)
+                data["total_deforestation"] += (plot.get("deforested_area") or 0)
+
+                risk_level = (plot.get("risk_level") or "").lower()
+                if risk_level == "high":
+                    data["high_risk_plots"] += 1
+                elif risk_level == "medium":
+                    data["medium_risk_plots"] += 1
+                elif risk_level == "low":
+                    data["low_risk_plots"] += 1
+
+            data["analysis_required"] = data["pending_plots"] > 0
             
-            if total_plots > 0:
-                # Recalculate based on unique plots
-                for plot in unique_plots_list:
-                    data["total_area"] += plot.get("area", 0)
-                    data["total_deforestation"] += plot.get("deforested_area", 0)
-                    
-                    # Count risk levels
-                    if plot["risk_level"] == "high":
-                        data["high_risk_plots"] += 1
-                    elif plot["risk_level"] == "medium":
-                        data["medium_risk_plots"] += 1
-                    else:
-                        data["low_risk_plots"] += 1
-                
-                # Calculate overall risk level
-                high_risk_pct = (data["high_risk_plots"] / total_plots) * 100
-                medium_risk_pct = (data["medium_risk_plots"] / total_plots) * 100
-                
-                if high_risk_pct > 20:
+            analyzed_count = len(analyzed_plots)
+            analyzed_area = sum([(plot.get("area") or 0) for plot in analyzed_plots])
+
+            if analyzed_count > 0:
+                # Strict rule: any deforestation/high-risk plot => supplier is high risk.
+                if data["high_risk_plots"] > 0:
                     data["overall_risk"] = "high"
-                elif high_risk_pct > 5 or medium_risk_pct > 30:
+                elif data["medium_risk_plots"] > 0:
                     data["overall_risk"] = "medium"
                 else:
                     data["overall_risk"] = "low"
                 
-                # Calculate compliance score (100 - deforestation impact)
-                avg_deforestation = (data["total_deforestation"] / data["total_area"]) * 100 if data["total_area"] > 0 else 0
+                # Calculate compliance score (100 - deforestation impact) using analyzed area
+                avg_deforestation = (data["total_deforestation"] / analyzed_area) * 100 if analyzed_area > 0 else 0
                 data["compliance_score"] = max(0, min(100, 100 - (avg_deforestation * 2)))
                 data["avg_deforestation"] = avg_deforestation
                 
                 # Add summary info
                 data["total_unique_plots"] = total_plots
                 data["total_sharing_instances"] = sum([plot["total_shares"] for plot in unique_plots_list])
+                data["analyzed_plots"] = analyzed_count
             else:
                 data["overall_risk"] = "unknown"
                 data["compliance_score"] = 0
                 data["avg_deforestation"] = 0
-                data["total_unique_plots"] = 0
-                data["total_sharing_instances"] = 0
+                data["total_unique_plots"] = total_plots
+                data["total_sharing_instances"] = sum([plot["total_shares"] for plot in unique_plots_list])
+                data["analyzed_plots"] = 0
             
             # Remove the dict version, keep only the list for frontend
             del data["unique_plots"]
@@ -1371,6 +1401,193 @@ def get_risk_dashboard_data():
         print(f"Error in get_risk_dashboard_data: {str(e)}")
         frappe.log_error(frappe.get_traceback(), "get_risk_dashboard_data error")
         return {"suppliers": [], "summary": {}}
+
+
+@frappe.whitelist(methods=["POST"])
+def trigger_risk_analysis():
+    """Recalculate deforestation metrics for plots shared with the current customer."""
+    user = frappe.session.user
+    if user == "Guest":
+        frappe.throw(_("Not logged in"), frappe.PermissionError)
+
+    customer, _supplier = _get_party_from_user(user)
+    if not customer:
+        frappe.throw(_("Only Customers can analyze risk"), frappe.PermissionError)
+
+    analysis_cache_key = f"risk_analysis_completed_on::{customer}"
+    analyzed_plots_cache_key = f"risk_analyzed_plots::{customer}"
+    analyzed_plots_raw = frappe.cache().get_value(analyzed_plots_cache_key)
+    analyzed_plot_names = set()
+    if analyzed_plots_raw:
+        try:
+            parsed = json.loads(analyzed_plots_raw) if isinstance(analyzed_plots_raw, str) else analyzed_plots_raw
+            if isinstance(parsed, list):
+                analyzed_plot_names = {str(p).strip() for p in parsed if p}
+        except Exception:
+            analyzed_plot_names = set()
+
+    try:
+        from farmportal.api.landplots import calculate_deforestation_data, init_earth_engine
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "trigger_risk_analysis import error")
+        frappe.throw(_("Unable to load deforestation engine"))
+
+    query = """
+        SELECT r.name, r.shared_plots_json, r.purchase_order_data
+        FROM `tabRequest` r
+        WHERE r.customer = %s
+        AND (
+            (r.shared_plots_json IS NOT NULL AND r.shared_plots_json != '')
+            OR (r.purchase_order_data IS NOT NULL AND r.purchase_order_data != '')
+        )
+    """
+    requests_with_plots = frappe.db.sql(query, (customer,), as_dict=True)
+
+    plot_ids = []
+    for req in requests_with_plots:
+        try:
+            if req.shared_plots_json:
+                parsed = json.loads(req.shared_plots_json) if isinstance(req.shared_plots_json, str) else req.shared_plots_json
+                if isinstance(parsed, list):
+                    plot_ids.extend(parsed)
+                elif parsed:
+                    plot_ids.append(parsed)
+        except Exception:
+            pass
+
+        if req.purchase_order_data:
+            try:
+                po_data = json.loads(req.purchase_order_data) if isinstance(req.purchase_order_data, str) else req.purchase_order_data
+                po_plots = (
+                    po_data.get("selected_plots")
+                    or po_data.get("selectedPlots")
+                    or po_data.get("plots")
+                    or []
+                )
+                if isinstance(po_plots, str):
+                    try:
+                        po_plots = json.loads(po_plots)
+                    except Exception:
+                        po_plots = [p.strip() for p in po_plots.split(",") if p.strip()]
+                if isinstance(po_plots, list) and po_plots and isinstance(po_plots[0], dict):
+                    po_plots = [p.get("id") or p.get("plot_id") or p.get("name") for p in po_plots]
+                    po_plots = [p for p in po_plots if p]
+                if isinstance(po_plots, list):
+                    plot_ids.extend(po_plots)
+            except Exception:
+                pass
+
+    normalized_ids = []
+    seen = set()
+    for pid in plot_ids:
+        key = str(pid).strip()
+        if key and key not in seen:
+            seen.add(key)
+            normalized_ids.append(key)
+
+    if not normalized_ids:
+        return {
+            "ok": True,
+            "message": "No new shared plots to analyze",
+            "total": 0,
+            "updated": 0,
+            "skipped": 0,
+            "failed": 0
+        }
+
+    plot_meta = frappe.get_meta("Land Plot")
+    has_plot_id = plot_meta.has_field("plot_id")
+
+    matched_names = set()
+    by_name = frappe.get_all(
+        "Land Plot",
+        filters={"name": ["in", normalized_ids]},
+        fields=["name"]
+    )
+    matched_names.update([p.name for p in by_name])
+
+    unresolved_ids = [pid for pid in normalized_ids if pid not in matched_names]
+    if has_plot_id and unresolved_ids:
+        by_plot_id = frappe.get_all(
+            "Land Plot",
+            filters={"plot_id": ["in", unresolved_ids]},
+            fields=["name"]
+        )
+        matched_names.update([p.name for p in by_plot_id])
+
+    if not matched_names:
+        return {
+            "ok": True,
+            "message": "No matching Land Plots found",
+            "total": 0,
+            "updated": 0,
+            "skipped": 0,
+            "failed": 0
+        }
+
+    pending_names = [name for name in matched_names if name not in analyzed_plot_names]
+    if not pending_names:
+        return {
+            "ok": True,
+            "message": "No new plots to analyze",
+            "total": 0,
+            "updated": 0,
+            "skipped": 0,
+            "failed": 0
+        }
+
+    plots = frappe.get_all(
+        "Land Plot",
+        filters={"name": ["in", list(pending_names)]},
+        fields=["name", "plot_id", "coordinates"]
+    )
+
+    init_earth_engine()
+
+    updated = 0
+    skipped = 0
+    failed = []
+
+    for plot in plots:
+        coords = plot.get("coordinates")
+        if isinstance(coords, str):
+            try:
+                coords = json.loads(coords)
+            except Exception:
+                coords = None
+
+        if not coords or not isinstance(coords, list):
+            skipped += 1
+            continue
+
+        try:
+            stats = calculate_deforestation_data(coords)
+            if not stats:
+                failed.append({"plot": plot.get("name"), "reason": "No stats returned"})
+                continue
+
+            doc = frappe.get_doc("Land Plot", plot.get("name"))
+            doc.set("deforestation_percentage", stats.get("deforestation_percent", 0))
+            doc.set("deforested_area", stats.get("loss_area_ha", 0))
+            doc.save(ignore_permissions=True)
+            updated += 1
+            analyzed_plot_names.add(str(plot.get("name")).strip())
+        except Exception as e:
+            failed.append({"plot": plot.get("name"), "reason": str(e)})
+
+    frappe.db.commit()
+    frappe.cache().set_value(analysis_cache_key, now_datetime().isoformat())
+    frappe.cache().set_value(analyzed_plots_cache_key, json.dumps(sorted(analyzed_plot_names)))
+
+    return {
+        "ok": True,
+        "message": "Risk analysis completed",
+        "total": len(plots),
+        "updated": updated,
+        "skipped": skipped,
+        "failed": len(failed),
+        "failed_plots": failed[:20]
+    }
 
 
 

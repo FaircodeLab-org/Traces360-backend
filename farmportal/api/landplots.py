@@ -614,13 +614,43 @@ def get_global_deforestation_tiles():
             "palette": ["#ff0000"]
         }
 
+        canopy_loss_vis = {
+            "min": 1,
+            "max": 1,
+            "palette": ["#ff8c00"]
+        }
+
         # Generate global tile URLs
         global_tree_cover = tree_cover_2000.updateMask(forest_mask).getMapId(tree_cover_vis)
         global_deforestation = loss_after_2020.selfMask().getMapId(deforestation_vis)
+        global_canopy_loss_url = None
+
+        # Sentinel-2 canopy loss (baseline vs recent NDVI drop, masked by forest)
+        try:
+            s2 = (
+                ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+                .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
+            )
+            s2_2020 = s2.filterDate("2019-01-01", "2020-12-31").median()
+            s2_recent = s2.filterDate("2024-01-01", "2026-01-01").median()
+
+            ndvi_2020 = s2_2020.normalizedDifference(["B8", "B4"])
+            ndvi_recent = s2_recent.normalizedDifference(["B8", "B4"])
+            ndvi_change = ndvi_2020.subtract(ndvi_recent)
+
+            recent_canopy_loss = ndvi_change.gt(0.25).And(forest_mask)
+            global_canopy_loss = recent_canopy_loss.selfMask().getMapId(canopy_loss_vis)
+            global_canopy_loss_url = global_canopy_loss["tile_fetcher"].url_format
+        except Exception as sentinel_error:
+            safe_log_error(
+                f"Sentinel-2 canopy loss tile generation failed: {str(sentinel_error)}",
+                "Sentinel Layer Error"
+            )
 
         return {
             "global_tree_cover_url": global_tree_cover['tile_fetcher'].url_format,
-            "global_deforestation_url": global_deforestation['tile_fetcher'].url_format
+            "global_deforestation_url": global_deforestation['tile_fetcher'].url_format,
+            "global_canopy_loss_url": global_canopy_loss_url
         }
 
     except Exception as e:
@@ -703,10 +733,9 @@ def create_single_plot_internal(plot_data, supplier, calculate_deforestation=Tru
             unique_plot_id = f"PLOT-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
             break
     
-    # Calculate deforestation data if coordinates are provided
+    # Calculate deforestation data only when explicitly requested
     deforestation_data = None
-    # if calculate_deforestation and plot_data.get('coordinates'):
-    if plot_data.get('coordinates'):
+    if calculate_deforestation and plot_data.get('coordinates'):
         coordinates = plot_data.get('coordinates')
         if isinstance(coordinates, str):
             try:
@@ -860,13 +889,14 @@ def bulk_create_land_plots(plots_data, calculate_deforestation=True):
     created_plots = []
     failed_plots = []
     
-    # Initialize Earth Engine once for all plots
-    init_earth_engine()
+    # Initialize Earth Engine only when requested
+    if calculate_deforestation:
+        init_earth_engine()
     
     for i, plot_data in enumerate(plots):
         try:
             # Create plot with unique ID generation
-            result = create_single_plot_internal(plot_data, supplier, True)
+            result = create_single_plot_internal(plot_data, supplier, calculate_deforestation)
             created_plots.append(result)
             frappe.db.commit()  # Commit each successful creation
             
