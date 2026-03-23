@@ -6,6 +6,8 @@ from frappe.utils.file_manager import save_file
 
 DT = "Questionnaire"
 CHILD_DT = "Questionnaire Question"
+TEMPLATE_DT = "Questionnaire Template"
+TEMPLATE_CHILD_DT = "Questionnaire Template Question"
 CHOICE_INPUT_TYPES = {"Multiple Choice", "Checkbox", "Dropdown"}
 SECTION_INPUT_TYPE = "Section"
 
@@ -134,6 +136,96 @@ def _resolve_supplier_for_user(user: str) -> str | None:
     return None
 
 
+def _is_system_manager(user: str) -> bool:
+    try:
+        return "System Manager" in frappe.get_roles(user)
+    except Exception:
+        return False
+
+
+def _parse_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _validate_question_payload(qlist: list[dict]) -> None:
+    if not qlist:
+        frappe.throw(_t("Questions are required"))
+
+    has_real_question = False
+    for q in qlist:
+        if not isinstance(q, dict):
+            continue
+
+        question = (q.get("question") or q.get("question_text") or "").strip()
+        input_type = _normalize_input_type(q.get("input_type") or q.get("type") or "Short Answer")
+
+        if not question:
+            frappe.throw(_t("Question text is required"))
+
+        if input_type != SECTION_INPUT_TYPE:
+            has_real_question = True
+
+        if input_type in CHOICE_INPUT_TYPES:
+            options = [x.strip() for x in _ensure_options(q.get("options")).splitlines() if x.strip()]
+            if not options:
+                frappe.throw(_t("Options are required for question: {0}").format(question))
+
+    if not has_real_question:
+        frappe.throw(_t("At least one non-section question is required"))
+
+
+def _append_question_rows(doc, qlist: list[dict], table_field: str = "questions") -> None:
+    for q in qlist:
+        if not isinstance(q, dict):
+            continue
+
+        item = doc.append(table_field, {})
+        item.question = (q.get("question") or q.get("question_text") or "").strip()
+        raw_type = q.get("input_type") or q.get("type") or "Short Answer"
+        item.input_type = _normalize_input_type(raw_type)
+
+        if item.input_type == SECTION_INPUT_TYPE:
+            item.required = 0
+            item.options_raw = (q.get("description") or q.get("section_description") or "").strip()
+            continue
+
+        item.required = 1 if q.get("required") else 0
+        if item.input_type in CHOICE_INPUT_TYPES:
+            item.options_raw = _ensure_options(q.get("options"))
+        else:
+            item.options_raw = ""
+
+
+def _serialize_question_row(row) -> dict:
+    options = []
+    if row.input_type in CHOICE_INPUT_TYPES:
+        options = (row.options_raw or "").splitlines()
+    description = (row.options_raw or "") if row.input_type == SECTION_INPUT_TYPE else ""
+    return {
+        "rowname": row.name,
+        "question": row.question,
+        "input_type": row.input_type,
+        "options": options,
+        "description": description,
+        "required": int(row.required or 0),
+        "answer": row.answer or "",
+    }
+
+
+def _ensure_template_access(doc, customer: str | None, is_manager: bool):
+    if is_manager:
+        return
+    if int(doc.get("is_public") or 0):
+        return
+    if customer and doc.get("customer") == customer:
+        return
+    frappe.throw(_t("Not permitted to access this template"), frappe.PermissionError)
+
+
 @frappe.whitelist()
 def create_questionnaire(supplier_id: str = None, title: str = None, questions: list | str = None, due_date: str | None = None, **kwargs):
     """
@@ -183,8 +275,7 @@ def create_questionnaire(supplier_id: str = None, title: str = None, questions: 
             frappe.throw(_t("Supplier '{0}' not found").format(supplier_id))
 
     qlist = _as_list(questions)
-    if not qlist:
-        frappe.throw(_t("Questions are required"))
+    _validate_question_payload(qlist)
 
     doc = frappe.new_doc(DT)
     doc.title = title
@@ -195,28 +286,7 @@ def create_questionnaire(supplier_id: str = None, title: str = None, questions: 
     if due_date:
         doc.due_date = due_date
 
-    for q in qlist:
-        if not isinstance(q, dict):
-            continue
-
-        item = doc.append("questions", {})
-        item.question = q.get("question") or q.get("question_text") or ""
-        
-        # Normalize input type
-        raw_type = q.get("input_type") or q.get("type") or "Text"
-        item.input_type = _normalize_input_type(raw_type)
-
-        # Section rows are form separators and don't require answers.
-        if item.input_type == SECTION_INPUT_TYPE:
-            item.required = 0
-            item.options_raw = (q.get("description") or q.get("section_description") or "").strip()
-            continue
-
-        item.required = 1 if q.get("required") else 0
-
-        # Handle options for choice-based questions
-        if item.input_type in CHOICE_INPUT_TYPES:
-            item.options_raw = _ensure_options(q.get("options"))
+    _append_question_rows(doc, qlist, table_field="questions")
 
     # Some sites may have custom mandatory parent fields on Questionnaire
     # (e.g. static form fields) that are unrelated to this API-driven flow.
@@ -270,6 +340,207 @@ def list_for_me(status: str | None = None):
         limit_page_length=200
     )
     return {"items": rows, "role": role}
+
+
+@frappe.whitelist()
+def list_templates():
+    user = frappe.session.user
+    if user == "Guest":
+        frappe.throw(_t("Not logged in"), frappe.PermissionError)
+
+    customer = _resolve_customer_for_user(user)
+    is_manager = _is_system_manager(user)
+
+    rows = frappe.get_all(
+        TEMPLATE_DT,
+        fields=[
+            "name as id", "title", "description", "customer",
+            "created_by", "is_public", "is_active", "modified"
+        ],
+        filters={"is_active": 1},
+        order_by="modified desc",
+        limit_page_length=500
+    )
+
+    items = []
+    for row in rows:
+        is_public = int(row.get("is_public") or 0)
+        is_owner = bool(customer and row.get("customer") == customer)
+        if is_manager or is_public or is_owner:
+            items.append({
+                "id": row.get("id"),
+                "title": row.get("title"),
+                "description": row.get("description") or "",
+                "customer": row.get("customer"),
+                "created_by": row.get("created_by"),
+                "is_public": is_public,
+                "modified": row.get("modified"),
+            })
+
+    return {"items": items}
+
+
+@frappe.whitelist()
+def get_template(template_id: str):
+    user = frappe.session.user
+    if user == "Guest":
+        frappe.throw(_t("Not logged in"), frappe.PermissionError)
+    if not template_id:
+        frappe.throw(_t("Template ID is required"))
+
+    customer = _resolve_customer_for_user(user)
+    is_manager = _is_system_manager(user)
+
+    doc = frappe.get_doc(TEMPLATE_DT, template_id)
+    _ensure_template_access(doc, customer, is_manager)
+
+    questions = []
+    for row in doc.get("questions") or []:
+        options = []
+        if row.input_type in CHOICE_INPUT_TYPES:
+            options = (row.options_raw or "").splitlines()
+        description = (row.options_raw or "") if row.input_type == SECTION_INPUT_TYPE else ""
+        questions.append({
+            "rowname": row.name,
+            "question": row.question,
+            "input_type": row.input_type,
+            "options": options,
+            "description": description,
+            "required": int(row.required or 0),
+        })
+
+    return {
+        "id": doc.name,
+        "title": doc.title,
+        "description": doc.description or "",
+        "is_public": int(doc.is_public or 0),
+        "customer": doc.customer,
+        "questions": questions,
+    }
+
+
+@frappe.whitelist()
+def save_template(
+    template_id: str | None = None,
+    title: str | None = None,
+    questions: list | str = None,
+    description: str | None = None,
+    is_public: int | str | None = 0,
+    **kwargs
+):
+    user = frappe.session.user
+    if user == "Guest":
+        frappe.throw(_t("Not logged in"), frappe.PermissionError)
+
+    payload = _parse_payload(kwargs)
+    template_id = template_id or payload.get("template_id") or payload.get("id")
+    title = title or payload.get("title")
+    description = description if description is not None else payload.get("description")
+    questions = questions if questions is not None else payload.get("questions")
+    is_public = payload.get("is_public", is_public)
+
+    if not title:
+        frappe.throw(_t("Template title is required"))
+
+    customer = _resolve_customer_for_user(user)
+    is_manager = _is_system_manager(user)
+    if not customer and not is_manager:
+        frappe.throw(_t("Only importer/customer users can manage templates"), frappe.PermissionError)
+
+    qlist = _as_list(questions)
+    _validate_question_payload(qlist)
+
+    if template_id:
+        doc = frappe.get_doc(TEMPLATE_DT, template_id)
+        if not is_manager and doc.customer != customer:
+            frappe.throw(_t("Not permitted to update this template"), frappe.PermissionError)
+    else:
+        doc = frappe.new_doc(TEMPLATE_DT)
+        doc.customer = customer if customer else None
+        doc.created_by = user
+
+    doc.title = title.strip()
+    doc.description = (description or "").strip()
+    doc.is_public = 1 if _parse_bool(is_public, default=False) else 0
+    doc.is_active = 1
+    doc.set("questions", [])
+    _append_question_rows(doc, qlist, table_field="questions")
+
+    doc.flags.ignore_mandatory = True
+    if template_id:
+        doc.save(ignore_permissions=True)
+    else:
+        doc.insert(ignore_permissions=True, ignore_mandatory=True)
+    frappe.db.commit()
+
+    return {"id": doc.name, "message": _t("Template saved successfully")}
+
+
+@frappe.whitelist()
+def create_questionnaire_from_template(
+    template_id: str = None,
+    supplier_id: str = None,
+    due_date: str | None = None,
+    title: str | None = None,
+    **kwargs
+):
+    user = frappe.session.user
+    if user == "Guest":
+        frappe.throw(_t("Not logged in"), frappe.PermissionError)
+
+    payload = _parse_payload(kwargs)
+    template_id = template_id or payload.get("template_id") or payload.get("id")
+    supplier_id = supplier_id or payload.get("supplier_id") or payload.get("supplier") or payload.get("supplier_name")
+    due_date = due_date or payload.get("due_date")
+    title = title or payload.get("title")
+
+    if not template_id:
+        frappe.throw(_t("Template ID is required"))
+    if not supplier_id:
+        frappe.throw(_t("Supplier is required"))
+
+    customer = _resolve_customer_for_user(user)
+    if not customer:
+        frappe.throw(_t("No Customer linked to your user ({0})").format(user), frappe.PermissionError)
+
+    is_manager = _is_system_manager(user)
+    template_doc = frappe.get_doc(TEMPLATE_DT, template_id)
+    _ensure_template_access(template_doc, customer, is_manager)
+
+    if not frappe.db.exists("Supplier", supplier_id):
+        by_supplier_name = frappe.db.get_value("Supplier", {"supplier_name": supplier_id}, "name")
+        if by_supplier_name:
+            supplier_id = by_supplier_name
+        else:
+            frappe.throw(_t("Supplier '{0}' not found").format(supplier_id))
+
+    qlist = []
+    for row in template_doc.get("questions") or []:
+        qlist.append({
+            "question": row.question,
+            "input_type": row.input_type,
+            "required": int(row.required or 0),
+            "options": (row.options_raw or "").splitlines() if row.input_type in CHOICE_INPUT_TYPES else [],
+            "description": (row.options_raw or "") if row.input_type == SECTION_INPUT_TYPE else "",
+        })
+
+    _validate_question_payload(qlist)
+
+    doc = frappe.new_doc(DT)
+    doc.title = (title or template_doc.title or "Questionnaire").strip()
+    doc.customer = customer
+    doc.supplier = supplier_id
+    doc.status = "Pending"
+    doc.created_by = user
+    if due_date:
+        doc.due_date = due_date
+
+    _append_question_rows(doc, qlist, table_field="questions")
+
+    doc.flags.ignore_mandatory = True
+    doc.insert(ignore_permissions=True, ignore_mandatory=True)
+    frappe.db.commit()
+    return {"id": doc.name, "status": doc.status, "message": _t("Questionnaire created successfully from template")}
 
 
 @frappe.whitelist()
