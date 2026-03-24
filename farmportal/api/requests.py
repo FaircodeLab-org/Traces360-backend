@@ -1874,6 +1874,88 @@ def submit_risk_mitigation(plot_name: str, note: str | None = None):
 # Add to your requests.py file
 
 @frappe.whitelist()
+def download_request_attachment(request_id, file_url=None, file_name=None):
+    """Download a Request attachment for the Request's customer or supplier."""
+    user = frappe.session.user
+    if user == "Guest":
+        frappe.throw(_("Not logged in"), frappe.PermissionError)
+
+    request_doc = frappe.get_doc("Request", request_id)
+
+    def _resolve_linked_names(target_doctype: str) -> set[str]:
+        names = set()
+
+        direct = _link_by_user_field(target_doctype, user)
+        if direct:
+            names.add(str(direct).strip())
+
+        email = _get_user_email(user)
+        if not email:
+            return {n for n in names if n}
+
+        contacts = frappe.get_all("Contact Email", filters={"email_id": email}, fields=["parent"])
+        contact_names = [c.get("parent") for c in contacts if c.get("parent")]
+        if not contact_names:
+            return {n for n in names if n}
+
+        links = frappe.get_all(
+            "Dynamic Link",
+            filters={
+                "parenttype": "Contact",
+                "parent": ["in", contact_names],
+                "link_doctype": target_doctype,
+            },
+            fields=["link_name"],
+            limit_page_length=500,
+        )
+
+        for row in links:
+            link_name = str(row.get("link_name") or "").strip()
+            if link_name:
+                names.add(link_name)
+
+        return names
+
+    customer_names = _resolve_linked_names("Customer")
+    supplier_names = _resolve_linked_names("Supplier")
+
+    request_customer = str(request_doc.customer or "").strip()
+    request_supplier = str(request_doc.supplier or "").strip()
+
+    is_customer_owner = bool(request_customer and request_customer in customer_names)
+    is_supplier_owner = bool(request_supplier and request_supplier in supplier_names)
+    is_admin_reader = frappe.has_permission("Request", "read", doc=request_doc)
+
+    if not (is_customer_owner or is_supplier_owner or is_admin_reader):
+        frappe.throw(_("Not permitted to download this attachment"), frappe.PermissionError)
+
+    filters = {
+        "attached_to_doctype": "Request",
+        "attached_to_name": request_id,
+    }
+    if file_name:
+        filters["name"] = file_name
+    elif file_url:
+        filters["file_url"] = file_url
+    else:
+        frappe.throw(_("file_url or file_name is required"))
+
+    file_rows = frappe.get_all(
+        "File",
+        filters=filters,
+        fields=["name", "file_name"],
+        limit=1,
+    )
+    if not file_rows:
+        frappe.throw(_("Attachment not found"), frappe.DoesNotExistError)
+
+    file_doc = frappe.get_doc("File", file_rows[0]["name"])
+    frappe.local.response.filename = file_rows[0].get("file_name") or file_doc.file_name or file_doc.name
+    frappe.local.response.filecontent = file_doc.get_content()
+    frappe.local.response.type = "download"
+
+
+@frappe.whitelist()
 def get_purchase_order_details(request_id):
     """Get purchase order details for supplier response"""
     user = frappe.session.user
@@ -1926,11 +2008,35 @@ def get_purchase_order_details(request_id):
             for i in items
         ]
 
+        request_message = (request_doc.get("message") or "").strip()
+
+        attachments = frappe.get_all(
+            "File",
+            filters={
+                "attached_to_doctype": "Request",
+                "attached_to_name": request_id,
+            },
+            fields=["name", "file_name", "file_url", "is_private", "creation"],
+            order_by="creation asc"
+        )
+
+        for att in attachments:
+            url = att.get("file_url")
+            if url and not str(url).startswith(("http://", "https://")):
+                att["absolute_url"] = frappe.utils.get_url(url)
+            else:
+                att["absolute_url"] = url
+
+        purchase_order_attachment = attachments[0] if attachments else None
+
         return {
             "request_id": request_id,
             "purchase_order_number": po_number,
             "supplier": supplier,
             "customer": request_doc.customer,
+            "request_message": request_message,
+            "purchase_order_attachment": purchase_order_attachment,
+            "attachments": attachments,
             "plots": plots,
             "products": products,
             "existing_batches": []  # Can be populated from a Batch doctype if exists
