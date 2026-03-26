@@ -5,6 +5,24 @@ app_description = "Farm portal"
 app_email = "abdullamirshadcl@gmail.com"
 app_license = "mit"
 
+fixtures = [
+    {
+        "dt": "Custom Field",
+        "filters": [
+            ["dt", "in", ["Supplier", "Customer"]],
+            ["fieldname", "=", "custom_user"],
+        ],
+    },
+    {
+        "dt": "Item Group",
+        "filters": [["name", "=", "EUDR Commodities"]],
+    },
+    {
+        "dt": "Item",
+        "filters": [["item_group", "=", "EUDR Commodities"]],
+    },
+]
+
 # your_app/hooks.py
 doc_events = {
     "Supplier": {
@@ -302,4 +320,3 @@ override_whitelisted_methods = {
 # default_log_clearing_doctypes = {
 # 	"Logging DocType Name": 30  # days to retain logs
 # }
-

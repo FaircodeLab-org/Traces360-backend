@@ -1,0 +1,15 @@
+[
+ {
+  "docstatus": 0,
+  "doctype": "Item Group",
+  "image": null,
+  "is_group": 0,
+  "item_group_defaults": [],
+  "item_group_name": "EUDR commodities",
+  "modified": "2026-03-26 14:19:26.322493",
+  "name": "EUDR commodities",
+  "old_parent": "All Item Groups",
+  "parent_item_group": "All Item Groups",
+  "taxes": []
+ }
+]
