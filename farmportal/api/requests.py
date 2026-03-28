@@ -135,19 +135,10 @@ def _collect_pending_risk_plot_names(customer: str, analyzed_plot_names: set[str
     if not matched_names:
         return []
 
+    # Pending state must be driven by explicit risk-analysis cache state.
+    # Land Plot numeric fields can be present with defaults (0/0) before analysis,
+    # so treating non-null persisted values as "already analyzed" causes false LOW risk.
     effective_analyzed = {str(n).strip() for n in analyzed_plot_names if n}
-    analyzed_rows = frappe.get_all(
-        "Land Plot",
-        filters={"name": ["in", list(matched_names)]},
-        fields=["name", "deforestation_percentage", "deforested_area"],
-    )
-    for row in analyzed_rows:
-        # Persisted analysis on the plot should survive server/cache restarts.
-        if row.get("deforestation_percentage") is not None or row.get("deforested_area") is not None:
-            nm = str(row.get("name") or "").strip()
-            if nm:
-                effective_analyzed.add(nm)
-
     pending = [name for name in matched_names if name not in effective_analyzed]
     pending = [str(n).strip() for n in pending if n]
     pending.sort()
@@ -1136,11 +1127,7 @@ def get_shared_plots(request_id):
 @frappe.whitelist()
 def respond_to_request(request_id, action=None, message=None, shared_plots=None, status=None):
     """Supplier-side: respond to a Request with optional land plot sharing."""
-    
-    # FIRST - ALWAYS print this to confirm function is called
-    print(f"🚨 RESPOND_TO_REQUEST CALLED: {request_id}")
-    print(f"🚨 ALL PARAMS: request_id={request_id}, action={action}, message={message}, shared_plots={shared_plots}, status={status}")
-    
+
     user = frappe.session.user
     if user == "Guest":
         frappe.throw(_("Not logged in"), frappe.PermissionError)
@@ -1165,9 +1152,6 @@ def respond_to_request(request_id, action=None, message=None, shared_plots=None,
 
     # SIMPLE shared plots handling
     if shared_plots:
-        print(f"🔥 SHARED PLOTS RECEIVED: {shared_plots}")
-        print(f"🔥 TYPE: {type(shared_plots)}")
-
         plots_list = None
         if isinstance(shared_plots, list):
             plots_list = shared_plots
@@ -1190,16 +1174,11 @@ def respond_to_request(request_id, action=None, message=None, shared_plots=None,
 
         plots_json = json.dumps(plots_list)
         doc.shared_plots_json = plots_json
-        print(f"🔥 SETTING shared_plots_json TO: {plots_json}")
-    else:
-        print(f"🔥 NO SHARED PLOTS RECEIVED")
 
     doc.responded_by = user
-    
-    print(f"🔥 SAVING DOCUMENT...")
+
     doc.save(ignore_permissions=True)
     frappe.db.commit()
-    print(f"🔥 DOCUMENT SAVED!")
 
     return {
         "id": doc.name,
@@ -1453,13 +1432,9 @@ def get_risk_dashboard_data():
             # use cache + persisted field values so status survives cache/server restarts.
             for plot in unique_plots_list:
                 plot_name = str(plot.get("name") or "").strip()
-                has_persisted_analysis = (
-                    plot.get("deforestation_percentage") is not None
-                    or plot.get("deforested_area") is not None
-                )
-                plot_analysis_required = not plot_name or (
-                    plot_name not in analyzed_plot_names and not has_persisted_analysis
-                )
+                # Use cache-driven analyzed state only; persisted numeric defaults (0/0)
+                # must not auto-mark fresh shares as analyzed.
+                plot_analysis_required = not plot_name or (plot_name not in analyzed_plot_names)
                 plot["analysis_required"] = bool(plot_analysis_required)
 
                 if not plot_analysis_required and plot_name:
@@ -1714,6 +1689,15 @@ def get_risk_analysis_progress():
 @frappe.whitelist(methods=["POST"])
 def trigger_risk_analysis():
     """Queue risk analysis and return immediately; progress is exposed via polling endpoint."""
+    def _is_truthy(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return False
+
     user = frappe.session.user
     if user == "Guest":
         frappe.throw(_("Not logged in"), frappe.PermissionError)
@@ -1731,7 +1715,27 @@ def trigger_risk_analysis():
         progress["already_running"] = True
         return progress
 
-    analyzed_raw = _cache_get_json(keys["analyzed"], []) or []
+    form = frappe.form_dict or {}
+    force_requested = any(
+        _is_truthy(form.get(flag))
+        for flag in (
+            "force",
+            "include_all",
+            "reanalyze_all",
+            "force_reanalysis",
+            "analyze_all",
+            "all_plots",
+            "full_refresh",
+            "refresh_existing",
+            "recalculate_all",
+        )
+    )
+
+    if force_requested:
+        _cache_set_json(keys["analyzed"], [])
+        analyzed_raw = []
+    else:
+        analyzed_raw = _cache_get_json(keys["analyzed"], []) or []
     analyzed_plot_names = {str(p).strip() for p in analyzed_raw if p}
     pending_names = _collect_pending_risk_plot_names(customer, analyzed_plot_names)
 
