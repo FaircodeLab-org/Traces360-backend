@@ -4,6 +4,7 @@ import json
 import frappe
 from frappe import _
 from frappe.utils import now_datetime, get_datetime
+from urllib.parse import urlparse
 
 DT = "Request"
 RISK_ANALYSIS_CACHE_VERSION = "hansen_sentinel_area_v2"
@@ -1314,6 +1315,30 @@ def get_risk_dashboard_data():
                         plot_fields.append("custom_risk_mitigation_on")
                     if plot_meta.has_field("custom_risk_mitigation_by"):
                         plot_fields.append("custom_risk_mitigation_by")
+                    attachment_field_candidates = [
+                        "custom_risk_mitigation_attachment",
+                        "custom_risk_mitigation_file",
+                        "custom_risk_mitigation_document",
+                        "risk_mitigation_attachment",
+                    ]
+                    attachment_name_field_candidates = [
+                        "custom_risk_mitigation_attachment_name",
+                        "custom_risk_mitigation_file_name",
+                        "custom_risk_mitigation_document_name",
+                        "risk_mitigation_attachment_name",
+                    ]
+                    mitigation_attachment_field = next(
+                        (field for field in attachment_field_candidates if plot_meta.has_field(field)),
+                        None,
+                    )
+                    mitigation_attachment_name_field = next(
+                        (field for field in attachment_name_field_candidates if plot_meta.has_field(field)),
+                        None,
+                    )
+                    if mitigation_attachment_field:
+                        plot_fields.append(mitigation_attachment_field)
+                    if mitigation_attachment_name_field:
+                        plot_fields.append(mitigation_attachment_name_field)
 
                     plots = frappe.get_all("Land Plot", 
                         filters={"name": ["in", plot_ids]},
@@ -1324,6 +1349,28 @@ def get_risk_dashboard_data():
                             filters={"plot_id": ["in", plot_ids]},
                             fields=plot_fields
                         )
+
+                    plot_names_for_files = [
+                        str(p.get("name") or "").strip()
+                        for p in plots
+                        if p.get("name")
+                    ]
+                    fallback_attachment_by_plot = {}
+                    if plot_names_for_files:
+                        file_rows = frappe.get_all(
+                            "File",
+                            filters={
+                                "attached_to_doctype": "Land Plot",
+                                "attached_to_name": ["in", plot_names_for_files],
+                            },
+                            fields=["name", "attached_to_name", "file_url", "file_name", "creation"],
+                            order_by="creation desc",
+                            limit_page_length=5000,
+                        )
+                        for row in file_rows:
+                            attached_to_name = str(row.get("attached_to_name") or "").strip()
+                            if attached_to_name and attached_to_name not in fallback_attachment_by_plot:
+                                fallback_attachment_by_plot[attached_to_name] = row
                     
                     for plot in plots:
                         plot_unique_id = plot["name"]  # Use plot name as unique identifier
@@ -1341,6 +1388,17 @@ def get_risk_dashboard_data():
                         plot["mitigation_note"] = plot.get("custom_risk_mitigation_note")
                         plot["mitigation_on"] = plot.get("custom_risk_mitigation_on")
                         plot["mitigation_by"] = plot.get("custom_risk_mitigation_by")
+                        fallback_attachment = fallback_attachment_by_plot.get(str(plot.get("name") or "").strip()) or {}
+                        plot_attachment_url = (
+                            plot.get(mitigation_attachment_field) if mitigation_attachment_field else ""
+                        ) or fallback_attachment.get("file_url") or ""
+                        plot_attachment_name = (
+                            plot.get(mitigation_attachment_name_field) if mitigation_attachment_name_field else ""
+                        ) or fallback_attachment.get("file_name") or ""
+                        plot_attachment_docname = fallback_attachment.get("name") or ""
+                        plot["mitigation_attachment"] = plot_attachment_url
+                        plot["mitigation_attachment_name"] = plot_attachment_name
+                        plot["mitigation_attachment_file_name"] = plot_attachment_docname
                         
                         # ✅ DEDUPLICATION LOGIC
                         if plot_unique_id in suppliers_data[supplier_name]["unique_plots"]:
@@ -1359,6 +1417,9 @@ def get_risk_dashboard_data():
                             existing_plot["mitigation_note"] = plot.get("mitigation_note")
                             existing_plot["mitigation_on"] = plot.get("mitigation_on")
                             existing_plot["mitigation_by"] = plot.get("mitigation_by")
+                            existing_plot["mitigation_attachment"] = plot.get("mitigation_attachment")
+                            existing_plot["mitigation_attachment_name"] = plot.get("mitigation_attachment_name")
+                            existing_plot["mitigation_attachment_file_name"] = plot.get("mitigation_attachment_file_name")
                             existing_plot["plot_name"] = plot_label
 
                             # Update with latest data if this request is more recent
@@ -1391,6 +1452,9 @@ def get_risk_dashboard_data():
                                 "mitigation_note": plot.get("mitigation_note"),
                                 "mitigation_on": plot.get("mitigation_on"),
                                 "mitigation_by": plot.get("mitigation_by"),
+                                "mitigation_attachment": plot.get("mitigation_attachment"),
+                                "mitigation_attachment_name": plot.get("mitigation_attachment_name"),
+                                "mitigation_attachment_file_name": plot.get("mitigation_attachment_file_name"),
                                 "shared_in_requests": [{
                                     "request_id": request.name,
                                     "request_date": request.creation,
@@ -1791,7 +1855,12 @@ def trigger_risk_analysis():
 
 
 @frappe.whitelist(methods=["POST"])
-def submit_risk_mitigation(plot_name: str, note: str | None = None):
+def submit_risk_mitigation(
+    plot_name: str,
+    note: str | None = None,
+    attachment_url: str | None = None,
+    attachment_name: str | None = None
+):
     user = frappe.session.user
     if user == "Guest":
         frappe.throw(_("Not logged in"), frappe.PermissionError)
@@ -1880,11 +1949,36 @@ def submit_risk_mitigation(plot_name: str, note: str | None = None):
     if missing:
         frappe.throw(_("Missing Land Plot fields: {0}. Please create these custom fields first.").format(", ".join(missing)))
 
+    attachment_field_candidates = [
+        "custom_risk_mitigation_attachment",
+        "custom_risk_mitigation_file",
+        "custom_risk_mitigation_document",
+        "risk_mitigation_attachment",
+    ]
+    attachment_name_field_candidates = [
+        "custom_risk_mitigation_attachment_name",
+        "custom_risk_mitigation_file_name",
+        "custom_risk_mitigation_document_name",
+        "risk_mitigation_attachment_name",
+    ]
+    mitigation_attachment_field = next(
+        (field for field in attachment_field_candidates if meta.has_field(field)),
+        None,
+    )
+    mitigation_attachment_name_field = next(
+        (field for field in attachment_name_field_candidates if meta.has_field(field)),
+        None,
+    )
+
     doc = frappe.get_doc("Land Plot", plot_name)
     doc.set("custom_risk_mitigated", 1)
     doc.set("custom_risk_mitigation_note", note or "")
     doc.set("custom_risk_mitigation_on", now_datetime())
     doc.set("custom_risk_mitigation_by", user)
+    if mitigation_attachment_field and attachment_url is not None:
+        doc.set(mitigation_attachment_field, attachment_url or "")
+    if mitigation_attachment_name_field and attachment_name is not None:
+        doc.set(mitigation_attachment_name_field, attachment_name or "")
     doc.save(ignore_permissions=True)
     frappe.db.commit()
 
@@ -1964,6 +2058,82 @@ def download_request_attachment(request_id, file_url=None, file_name=None):
         "File",
         filters=filters,
         fields=["name", "file_name"],
+        limit=1,
+    )
+    if not file_rows:
+        frappe.throw(_("Attachment not found"), frappe.DoesNotExistError)
+
+    file_doc = frappe.get_doc("File", file_rows[0]["name"])
+    frappe.local.response.filename = file_rows[0].get("file_name") or file_doc.file_name or file_doc.name
+    frappe.local.response.filecontent = file_doc.get_content()
+    frappe.local.response.type = "download"
+
+
+@frappe.whitelist()
+def download_risk_mitigation_attachment(plot_name, file_url=None, file_name=None):
+    """Download a mitigation attachment for a Land Plot shared with the logged-in customer."""
+    user = frappe.session.user
+    if user == "Guest":
+        frappe.throw(_("Not logged in"), frappe.PermissionError)
+
+    customer, supplier_link = _get_party_from_user(user)
+    if not customer:
+        frappe.throw(_("Only Customers can download mitigation attachments"), frappe.PermissionError)
+
+    if not plot_name:
+        frappe.throw(_("plot_name is required"))
+
+    if not frappe.db.exists("Land Plot", plot_name):
+        frappe.throw(_("Land Plot not found"))
+
+    plot_doc = frappe.get_doc("Land Plot", plot_name)
+    plot_id_value = str(plot_doc.get("plot_id") or "").strip()
+
+    requests_with_plots = frappe.db.sql(
+        """
+        SELECT r.name, r.shared_plots_json, r.purchase_order_data
+        FROM `tabRequest` r
+        WHERE r.customer = %s
+        AND (
+            (r.shared_plots_json IS NOT NULL AND r.shared_plots_json != '')
+            OR (r.purchase_order_data IS NOT NULL AND r.purchase_order_data != '')
+        )
+        """,
+        (customer,),
+        as_dict=True,
+    )
+
+    allowed = False
+    for req in requests_with_plots:
+        plot_ids = _parse_request_plot_ids(req)
+        if not plot_ids:
+            continue
+        if plot_name in plot_ids or (plot_id_value and plot_id_value in plot_ids):
+            allowed = True
+            break
+
+    if not allowed:
+        frappe.throw(_("You are not allowed to download this mitigation attachment"), frappe.PermissionError)
+
+    filters = {
+        "attached_to_doctype": "Land Plot",
+        "attached_to_name": plot_name,
+    }
+
+    if file_name:
+        filters["name"] = file_name
+    elif file_url:
+        normalized_url = str(file_url).strip()
+        if normalized_url.startswith(("http://", "https://")):
+            parsed = urlparse(normalized_url)
+            normalized_url = parsed.path or normalized_url
+        filters["file_url"] = normalized_url
+
+    file_rows = frappe.get_all(
+        "File",
+        filters=filters,
+        fields=["name", "file_name"],
+        order_by="creation desc",
         limit=1,
     )
     if not file_rows:
@@ -2228,6 +2398,10 @@ def get_purchase_order_response(request_id):
                 fields.insert(1, "plot_id")
             if name_field:
                 fields.insert(2 if has_plot_id else 1, f"{name_field} as plot_name")
+            if plot_meta.has_field("custom_risk_mitigated"):
+                fields.append("custom_risk_mitigated")
+            if plot_meta.has_field("custom_risk_mitigation_note"):
+                fields.append("custom_risk_mitigation_note")
 
             plots = frappe.get_all(
                 "Land Plot",
@@ -2240,6 +2414,8 @@ def get_purchase_order_response(request_id):
                     filters={"plot_id": ["in", plot_ids]},
                     fields=fields
                 )
+            for plot in plots:
+                plot["mitigated"] = bool(plot.get("custom_risk_mitigated"))
             detailed_plots = plots
 
         # Get detailed product information  
