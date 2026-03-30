@@ -2439,6 +2439,26 @@ def get_purchase_order_response(request_id):
             plot_meta = frappe.get_meta("Land Plot")
             has_plot_id = plot_meta.has_field("plot_id")
             name_field = "farmer_name" if plot_meta.has_field("farmer_name") else ("plot_name" if plot_meta.has_field("plot_name") else None)
+            attachment_field_candidates = [
+                "custom_risk_mitigation_attachment",
+                "custom_risk_mitigation_file",
+                "custom_risk_mitigation_document",
+                "risk_mitigation_attachment",
+            ]
+            attachment_name_field_candidates = [
+                "custom_risk_mitigation_attachment_name",
+                "custom_risk_mitigation_file_name",
+                "custom_risk_mitigation_document_name",
+                "risk_mitigation_attachment_name",
+            ]
+            mitigation_attachment_field = next(
+                (field for field in attachment_field_candidates if plot_meta.has_field(field)),
+                None,
+            )
+            mitigation_attachment_name_field = next(
+                (field for field in attachment_name_field_candidates if plot_meta.has_field(field)),
+                None,
+            )
 
             fields = [
                 "name as id",
@@ -2458,6 +2478,10 @@ def get_purchase_order_response(request_id):
                 fields.append("custom_risk_mitigated")
             if plot_meta.has_field("custom_risk_mitigation_note"):
                 fields.append("custom_risk_mitigation_note")
+            if mitigation_attachment_field:
+                fields.append(mitigation_attachment_field)
+            if mitigation_attachment_name_field:
+                fields.append(mitigation_attachment_name_field)
 
             plots = frappe.get_all(
                 "Land Plot",
@@ -2470,9 +2494,53 @@ def get_purchase_order_response(request_id):
                     filters={"plot_id": ["in", plot_ids]},
                     fields=fields
                 )
+
+            plot_names_for_files = [
+                str(p.get("id") or "").strip()
+                for p in plots
+                if p.get("id")
+            ]
+            fallback_attachment_by_plot = {}
+            if plot_names_for_files:
+                file_rows = frappe.get_all(
+                    "File",
+                    filters={
+                        "attached_to_doctype": "Land Plot",
+                        "attached_to_name": ["in", plot_names_for_files],
+                    },
+                    fields=["name", "attached_to_name", "file_url", "file_name", "creation"],
+                    order_by="creation desc",
+                    limit_page_length=5000,
+                )
+                for row in file_rows:
+                    attached_to_name = str(row.get("attached_to_name") or "").strip()
+                    if attached_to_name and attached_to_name not in fallback_attachment_by_plot:
+                        fallback_attachment_by_plot[attached_to_name] = row
+
             for plot in plots:
                 plot["mitigated"] = bool(plot.get("custom_risk_mitigated"))
+                fallback_attachment = fallback_attachment_by_plot.get(str(plot.get("id") or "").strip()) or {}
+                plot_attachment_url = (
+                    plot.get(mitigation_attachment_field) if mitigation_attachment_field else ""
+                ) or fallback_attachment.get("file_url") or ""
+                plot_attachment_name = (
+                    plot.get(mitigation_attachment_name_field) if mitigation_attachment_name_field else ""
+                ) or fallback_attachment.get("file_name") or ""
+                plot_attachment_docname = fallback_attachment.get("name") or ""
+                plot["mitigation_attachment"] = plot_attachment_url
+                plot["mitigation_attachment_name"] = plot_attachment_name
+                plot["mitigation_attachment_file_name"] = plot_attachment_docname
             detailed_plots = plots
+
+        request_attachments = frappe.get_all(
+            "File",
+            filters={
+                "attached_to_doctype": "Request",
+                "attached_to_name": request_id,
+            },
+            fields=["name", "file_name", "file_url", "is_private", "creation"],
+            order_by="creation asc",
+        )
 
         # Get detailed product information  
         detailed_products = []
@@ -2516,6 +2584,7 @@ def get_purchase_order_response(request_id):
                 "production_date_scope": po_data.get("production_date_scope", "per_plot"),
                 "products": detailed_products
             },
+            "request_attachments": request_attachments,
             "summary": {
                 "total_batches": total_batches,
                 "total_plots": total_plots,
