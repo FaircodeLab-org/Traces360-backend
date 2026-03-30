@@ -21,6 +21,14 @@ fixtures = [
         "dt": "Item",
         "filters": [["item_group", "=", "EUDR Commodities"]],
     },
+    {
+        "dt": "Email Template",
+        "filters": [["name", "=", "Traces360 Welcome Email"]],
+    },
+    {
+        "dt": "System Settings",
+        "filters": [["name", "=", "System Settings"]],
+    },
 ]
 
 # your_app/hooks.py

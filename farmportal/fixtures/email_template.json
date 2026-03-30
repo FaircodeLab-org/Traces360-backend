@@ -1,0 +1,10 @@
+[
+ {
+  "docstatus": 0,
+  "doctype": "Email Template",
+  "name": "Traces360 Welcome Email",
+  "subject": "Welcome to Traces360 - Complete your account setup",
+  "use_html": 0,
+  "response": "Hello {{ first_name | e }},\n\nWelcome to Traces360.\n\nYour account has been created successfully.\nLogin ID: {{ user }}\n\nComplete account setup using this link:\n{{ link }}\n\nThank you,\nTeam Traces360"
+ }
+]
