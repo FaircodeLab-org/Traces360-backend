@@ -729,16 +729,81 @@ def get_global_deforestation_tiles():
         frappe.throw(f"Error generating global tile URLs: {str(e)}")
 
 
-# Helper function to get supplier from user
-def _get_party_from_user(user):
-    """Get supplier from user"""
-    supplier_list = frappe.get_all("Supplier", 
-        filters={"custom_user": user}, 
-        fields=["name"]
+USER_LINK_FIELDS = {
+    "Customer": ["custom_user", "user_id", "user"],
+    "Supplier": ["custom_user", "user_id", "user"],
+}
+
+
+def _get_user_email(user: str) -> str | None:
+    try:
+        return frappe.db.get_value("User", user, "email")
+    except Exception:
+        return None
+
+
+def _link_by_contact_email(user: str, target_doctype: str) -> str | None:
+    """Fallback: User -> Contact(Email) -> Dynamic Link -> target doctype."""
+    email = _get_user_email(user)
+    if not email:
+        return None
+
+    contact_names = []
+
+    # Preferred path for ERPNext contacts.
+    try:
+        contact_rows = frappe.get_all("Contact Email", filters={"email_id": email}, fields=["parent"])
+        contact_names.extend([row.get("parent") for row in contact_rows if row.get("parent")])
+    except Exception:
+        pass
+
+    # Fallback path for instances storing email directly on Contact.
+    if not contact_names:
+        try:
+            contact_rows = frappe.get_all("Contact", filters={"email_id": email}, fields=["name"])
+            contact_names.extend([row.get("name") for row in contact_rows if row.get("name")])
+        except Exception:
+            pass
+
+    if not contact_names:
+        return None
+
+    dl = frappe.get_all(
+        "Dynamic Link",
+        filters={
+            "parenttype": "Contact",
+            "parent": ["in", contact_names],
+            "link_doctype": target_doctype,
+        },
+        fields=["link_name"],
+        limit=1,
     )
-    if supplier_list:
-        return None, supplier_list[0].name
-    return None, None
+    return dl[0]["link_name"] if dl else None
+
+
+def _link_by_user_field(doctype: str, user: str) -> str | None:
+    """Try mapping via known User Link fields on the doctype."""
+    try:
+        meta = frappe.get_meta(doctype)
+    except Exception:
+        return None
+
+    for fieldname in USER_LINK_FIELDS.get(doctype, []):
+        if meta.has_field(fieldname):
+            name = frappe.db.get_value(doctype, {fieldname: user}, "name")
+            if name:
+                return name
+    return None
+
+
+def _get_party_from_user(user):
+    """
+    Resolve (customer_name, supplier_name) for this User.
+    Supports primary owner users and invited member users linked via Contact.
+    """
+    customer = _link_by_user_field("Customer", user) or _link_by_contact_email(user, "Customer")
+    supplier = _link_by_user_field("Supplier", user) or _link_by_contact_email(user, "Supplier")
+    return customer, supplier
 
 @frappe.whitelist()
 def get_land_plots():

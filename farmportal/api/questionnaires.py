@@ -594,7 +594,15 @@ def get_one(q_id: str):
     Returns:
         Dictionary with questionnaire details and questions array
     """
+    user = frappe.session.user
+    if user == "Guest":
+        frappe.throw(_t("Not logged in"), frappe.PermissionError)
+
     doc = frappe.get_doc(DT, q_id)
+    customer, supplier = _get_party_from_user(user)
+    is_manager = _is_system_manager(user)
+    if not is_manager and doc.customer != customer and doc.supplier != supplier:
+        frappe.throw(_t("Not permitted to view this questionnaire"), frappe.PermissionError)
     
     # Serialize questions (include child row name so we can map answers)
     questions = []

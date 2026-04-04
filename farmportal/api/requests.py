@@ -143,9 +143,122 @@ def _parse_request_plot_ids(request_row: dict) -> list[str]:
             clean.append(key)
     return clean
 
+
+def _coerce_plot_refs(raw_value) -> list[str]:
+    """
+    Normalize shared-plot payloads into a clean list of identifiers (name/plot_id).
+    Accepts list / JSON string / python-literal string / scalar.
+    """
+    if raw_value is None:
+        return []
+
+    values = []
+    if isinstance(raw_value, list):
+        values = raw_value
+    elif isinstance(raw_value, str):
+        raw_text = raw_value.strip()
+        if not raw_text:
+            return []
+        try:
+            parsed = json.loads(raw_text)
+            values = parsed if isinstance(parsed, list) else [parsed]
+        except Exception:
+            try:
+                import ast
+                parsed = ast.literal_eval(raw_text)
+                values = parsed if isinstance(parsed, list) else [parsed]
+            except Exception:
+                values = [raw_text]
+    else:
+        values = [raw_value]
+
+    refs = []
+    seen = set()
+    for value in values:
+        if isinstance(value, dict):
+            candidate = (
+                value.get("id")
+                or value.get("name")
+                or value.get("plot_id")
+                or value.get("plotId")
+            )
+        else:
+            candidate = value
+
+        key = str(candidate).strip() if candidate is not None else ""
+        if key and key not in seen:
+            seen.add(key)
+            refs.append(key)
+
+    return refs
+
+
+def _resolve_supplier_plot_names(supplier_name: str, plot_refs: list[str]) -> list[str]:
+    """
+    Resolve incoming plot refs (docname or plot_id) to Land Plot docnames,
+    strictly scoped to a single supplier.
+    """
+    supplier_name = str(supplier_name or "").strip()
+    if not supplier_name:
+        return []
+
+    refs = []
+    seen_refs = set()
+    for ref in (plot_refs or []):
+        key = str(ref).strip()
+        if key and key not in seen_refs:
+            seen_refs.add(key)
+            refs.append(key)
+
+    if not refs:
+        return []
+
+    plot_meta = frappe.get_meta("Land Plot")
+    has_plot_id = plot_meta.has_field("plot_id")
+
+    by_name_rows = frappe.get_all(
+        "Land Plot",
+        filters={
+            "supplier": supplier_name,
+            "docstatus": ["!=", 2],
+            "name": ["in", refs],
+        },
+        fields=["name"],
+        limit_page_length=max(len(refs), 1),
+    )
+    by_name_set = {str(row.get("name") or "").strip() for row in by_name_rows}
+
+    plot_id_to_name = {}
+    if has_plot_id:
+        by_plot_id_rows = frappe.get_all(
+            "Land Plot",
+            filters={
+                "supplier": supplier_name,
+                "docstatus": ["!=", 2],
+                "plot_id": ["in", refs],
+            },
+            fields=["name", "plot_id"],
+            limit_page_length=max(len(refs), 1),
+        )
+        for row in by_plot_id_rows:
+            pid = str(row.get("plot_id") or "").strip()
+            name = str(row.get("name") or "").strip()
+            if pid and name and pid not in plot_id_to_name:
+                plot_id_to_name[pid] = name
+
+    resolved_names = []
+    seen_names = set()
+    for ref in refs:
+        resolved = ref if ref in by_name_set else plot_id_to_name.get(ref)
+        if resolved and resolved not in seen_names:
+            seen_names.add(resolved)
+            resolved_names.append(resolved)
+
+    return resolved_names
+
 def _collect_pending_risk_plot_names(customer: str, analyzed_plot_names: set[str]) -> list[str]:
     query = """
-        SELECT r.name, r.shared_plots_json, r.purchase_order_data
+        SELECT r.name, r.supplier, r.shared_plots_json, r.purchase_order_data
         FROM `tabRequest` r
         WHERE r.customer = %s
         AND (
@@ -1050,6 +1163,11 @@ def get_shared_plots(request_id):
             print(f"⚠️ No shared plots found in shared_plots_json or purchase_order_data")
             return {"plots": [], "request": {"id": request_doc.name, "status": request_doc.status}}
 
+        # Enforce supplier boundary to prevent cross-supplier plot leakage.
+        valid_plot_names = _resolve_supplier_plot_names(request_doc.supplier, plot_ids)
+        if not valid_plot_names:
+            return {"plots": [], "request": {"id": request_doc.name, "status": request_doc.status}}
+
         # Get the actual land plot data
         plots = []
         if plot_ids:
@@ -1057,9 +1175,9 @@ def get_shared_plots(request_id):
                 plot_ids = [plot_ids]
 
             plot_meta = frappe.get_meta("Land Plot")
-            has_plot_id = plot_meta.has_field("plot_id")
             fields = [
                 "name as id",
+                "plot_id",
                 "country",
                 "area",
                 "coordinates",
@@ -1067,8 +1185,8 @@ def get_shared_plots(request_id):
                 "deforestation_percentage",
                 "deforested_area"
             ]
-            if has_plot_id:
-                fields.insert(1, "plot_id")
+            if not plot_meta.has_field("plot_id"):
+                fields.remove("plot_id")
             if plot_meta.has_field("plot_name"):
                 fields.append("plot_name")
             if plot_meta.has_field("farmer_name"):
@@ -1076,17 +1194,12 @@ def get_shared_plots(request_id):
 
             plots = frappe.get_all(
                 "Land Plot",
-                filters={"name": ["in", plot_ids]},
+                filters={
+                    "supplier": request_doc.supplier,
+                    "name": ["in", valid_plot_names],
+                },
                 fields=fields
             )
-
-            # Fallback: if stored IDs are plot_id instead of doc name
-            if not plots and has_plot_id:
-                plots = frappe.get_all(
-                    "Land Plot",
-                    filters={"plot_id": ["in", plot_ids]},
-                    fields=fields
-                )
             
             print(f"✅ Found {len(plots)} matching plots")
 
@@ -1192,30 +1305,16 @@ def respond_to_request(request_id, action=None, message=None, shared_plots=None,
     if message:
         doc.response_message = message
 
-    # SIMPLE shared plots handling
+    # Shared plots handling with strict supplier ownership validation
     if shared_plots:
-        plots_list = None
-        if isinstance(shared_plots, list):
-            plots_list = shared_plots
-        elif isinstance(shared_plots, str):
-            try:
-                plots_list = json.loads(shared_plots)
-            except Exception:
-                try:
-                    import ast
-                    plots_list = ast.literal_eval(shared_plots)
-                except Exception:
-                    plots_list = [shared_plots]
-        else:
-            plots_list = [shared_plots]
-
-        if isinstance(plots_list, str):
-            plots_list = [plots_list]
-        if not isinstance(plots_list, list):
-            plots_list = [plots_list]
-
-        plots_json = json.dumps(plots_list)
-        doc.shared_plots_json = plots_json
+        requested_plot_refs = _coerce_plot_refs(shared_plots)
+        valid_plot_names = _resolve_supplier_plot_names(supplier, requested_plot_refs)
+        if not valid_plot_names:
+            frappe.throw(
+                _("No valid supplier-owned land plots found in shared_plots"),
+                frappe.PermissionError,
+            )
+        doc.shared_plots_json = json.dumps(valid_plot_names)
 
     doc.responded_by = user
 
@@ -1931,13 +2030,12 @@ def submit_risk_mitigation(
     if not frappe.db.exists("Land Plot", plot_name):
         frappe.throw(_("Land Plot not found"))
 
-    plot_doc = frappe.get_doc("Land Plot", plot_name)
-    plot_id_value = plot_doc.get("plot_id")
+    frappe.get_doc("Land Plot", plot_name)
 
     # Ensure this customer has a request that includes this plot
     requests_with_plots = frappe.db.sql(
         """
-        SELECT r.name, r.shared_plots_json, r.purchase_order_data
+        SELECT r.name, r.supplier, r.shared_plots_json, r.purchase_order_data
         FROM `tabRequest` r
         WHERE r.customer = %s
         AND (
@@ -1951,43 +2049,11 @@ def submit_risk_mitigation(
 
     allowed = False
     for req in requests_with_plots:
-        plot_ids = []
-        try:
-            if req.shared_plots_json:
-                parsed = json.loads(req.shared_plots_json) if isinstance(req.shared_plots_json, str) else req.shared_plots_json
-                if isinstance(parsed, list):
-                    plot_ids.extend(parsed)
-                else:
-                    plot_ids.append(parsed)
-        except Exception:
-            pass
-
-        if req.purchase_order_data:
-            try:
-                po_data = json.loads(req.purchase_order_data) if isinstance(req.purchase_order_data, str) else req.purchase_order_data
-                po_plots = (
-                    po_data.get("selected_plots")
-                    or po_data.get("selectedPlots")
-                    or po_data.get("plots")
-                    or []
-                )
-                if isinstance(po_plots, str):
-                    try:
-                        po_plots = json.loads(po_plots)
-                    except Exception:
-                        po_plots = [p.strip() for p in po_plots.split(",") if p.strip()]
-                if isinstance(po_plots, list) and po_plots and isinstance(po_plots[0], dict):
-                    po_plots = [p.get("id") or p.get("plot_id") or p.get("name") for p in po_plots]
-                    po_plots = [p for p in po_plots if p]
-                if isinstance(po_plots, list):
-                    plot_ids.extend(po_plots)
-            except Exception:
-                pass
-
+        plot_ids = _parse_request_plot_ids(req)
         if not plot_ids:
             continue
-
-        if plot_name in plot_ids or (plot_id_value and plot_id_value in plot_ids):
+        valid_plot_names = _resolve_supplier_plot_names(req.get("supplier"), plot_ids)
+        if plot_name in valid_plot_names:
             allowed = True
             break
 
@@ -2142,12 +2208,11 @@ def download_risk_mitigation_attachment(plot_name, file_url=None, file_name=None
     if not frappe.db.exists("Land Plot", plot_name):
         frappe.throw(_("Land Plot not found"))
 
-    plot_doc = frappe.get_doc("Land Plot", plot_name)
-    plot_id_value = str(plot_doc.get("plot_id") or "").strip()
+    frappe.get_doc("Land Plot", plot_name)
 
     requests_with_plots = frappe.db.sql(
         """
-        SELECT r.name, r.shared_plots_json, r.purchase_order_data
+        SELECT r.name, r.supplier, r.shared_plots_json, r.purchase_order_data
         FROM `tabRequest` r
         WHERE r.customer = %s
         AND (
@@ -2164,7 +2229,8 @@ def download_risk_mitigation_attachment(plot_name, file_url=None, file_name=None
         plot_ids = _parse_request_plot_ids(req)
         if not plot_ids:
             continue
-        if plot_name in plot_ids or (plot_id_value and plot_id_value in plot_ids):
+        valid_plot_names = _resolve_supplier_plot_names(req.get("supplier"), plot_ids)
+        if plot_name in valid_plot_names:
             allowed = True
             break
 
@@ -2632,12 +2698,23 @@ def get_customer_purchase_order_plots(request_id):
         # Parse PO data to get shared plot IDs
         try:
             po_data = json.loads(request_doc.purchase_order_data)
-            plot_ids = po_data.get("selected_plots", [])
+            raw_plot_refs = (
+                po_data.get("selected_plots")
+                or po_data.get("selectedPlots")
+                or po_data.get("plots")
+                or []
+            )
+            plot_ids = _coerce_plot_refs(raw_plot_refs)
         except:
             return {"plots": [], "message": "Error reading purchase order data"}
 
         if not plot_ids:
             return {"plots": [], "message": "No plots shared in this purchase order"}
+
+        # Enforce supplier boundary to prevent cross-supplier plot leakage.
+        valid_plot_names = _resolve_supplier_plot_names(request_doc.supplier, plot_ids)
+        if not valid_plot_names:
+            return {"plots": [], "message": "No valid supplier-owned plots shared in this purchase order"}
 
         # Get the plot details that were shared with this customer
         plot_meta = frappe.get_meta("Land Plot")
@@ -2660,15 +2737,12 @@ def get_customer_purchase_order_plots(request_id):
 
         plots = frappe.get_all(
             "Land Plot",
-            filters={"name": ["in", plot_ids]},
+            filters={
+                "supplier": request_doc.supplier,
+                "name": ["in", valid_plot_names],
+            },
             fields=fields
         )
-        if not plots and has_plot_id:
-            plots = frappe.get_all(
-                "Land Plot",
-                filters={"plot_id": ["in", plot_ids]},
-                fields=fields
-            )
 
         # Process commodities
         for plot in plots:

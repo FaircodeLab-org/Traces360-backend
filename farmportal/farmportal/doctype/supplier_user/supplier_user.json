@@ -16,21 +16,29 @@
   {
    "fieldname": "first_name",
    "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_preview": 1,
    "label": "First Name"
   },
   {
    "fieldname": "last_name",
    "fieldtype": "Data",
+   "in_preview": 1,
+   "in_standard_filter": 1,
    "label": "Last Name"
   },
   {
    "fieldname": "email",
    "fieldtype": "Data",
+   "in_preview": 1,
+   "in_standard_filter": 1,
    "label": "Email"
   },
   {
    "fieldname": "designation",
    "fieldtype": "Data",
+   "in_preview": 1,
+   "in_standard_filter": 1,
    "label": "Designation"
   },
   {
@@ -44,7 +52,7 @@
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2025-12-01 14:34:35.008231",
+ "modified": "2026-04-01 13:34:01.141726",
  "modified_by": "Administrator",
  "module": "Farmportal",
  "name": "Supplier User",
