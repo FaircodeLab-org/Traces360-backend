@@ -15,6 +15,60 @@ USER_LINK_FIELDS = {
     "Supplier": ["custom_user", "user_id", "user"],
 }
 
+
+def _coerce_page(value, default=1):
+    try:
+        page = int(value)
+        return page if page > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_page_size(value, default=25, max_size=100):
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        size = default
+    if size <= 0:
+        size = default
+    return min(size, max_size)
+
+
+def _build_pagination(page, page_size, total):
+    total_pages = (total + page_size - 1) // page_size if page_size else 0
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+    }
+
+
+def _parse_status_filters(status):
+    if status is None:
+        return []
+
+    if isinstance(status, (list, tuple, set)):
+        raw_values = status
+    else:
+        raw_values = str(status).split(",")
+
+    values = []
+    seen = set()
+    for raw in raw_values:
+        token = str(raw or "").strip()
+        if not token:
+            continue
+        lowered = token.lower()
+        if lowered in ("all", "*"):
+            continue
+        canonical = token[:1].upper() + token[1:]
+        if canonical not in seen:
+            seen.add(canonical)
+            values.append(canonical)
+    return values
+
+
 def _risk_cache_keys(customer: str) -> dict:
     versioned = f"{RISK_ANALYSIS_CACHE_VERSION}::{customer}"
     return {
@@ -442,7 +496,7 @@ def _get_party_from_user(user: str) -> tuple[str | None, str | None]:
 #         return {"requests": []}
 
 @frappe.whitelist()
-def get_customer_requests():
+def get_customer_requests(page=1, page_size=25, status=None):
     """Get all requests for the current customer"""
     user = frappe.session.user
     if user == "Guest":
@@ -453,23 +507,33 @@ def get_customer_requests():
         if not customer:
             frappe.throw(_("Customer not found for this user"), frappe.PermissionError)
         
-        print(f"🔍 Getting requests for customer: {customer}")
-        
-        # Get requests for this customer with PO number
+        page_no = _coerce_page(page, default=1)
+        page_len = _coerce_page_size(page_size, default=25, max_size=100)
+        offset = (page_no - 1) * page_len
+
+        filters = {"customer": customer}
+        status_values = _parse_status_filters(status)
+        if status_values:
+            filters["status"] = ["in", status_values]
+
+        total = int(frappe.db.count("Request", filters=filters) or 0)
+
         requests = frappe.get_all("Request", 
-            filters={"customer": customer},
+            filters=filters,
             fields=[
                 "name", "customer", "supplier", "request_type", "status", 
                 "creation", "response_message", "shared_plots_json", 
                 "message", "requested_by", "responded_by",
                 "purchase_order_number"  # ✅ Add this field
             ],
-            order_by="creation desc"
+            order_by="creation desc",
+            limit_start=offset,
+            limit_page_length=page_len,
         )
-        
-        print(f"📊 Found {len(requests)} requests for customer {customer}")
-        
-        return {"requests": requests}
+        return {
+            "requests": requests,
+            "pagination": _build_pagination(page_no, page_len, total),
+        }
         
     except Exception as e:
         print(f"Error in get_customer_requests: {str(e)}")
@@ -478,7 +542,7 @@ def get_customer_requests():
 
 
 @frappe.whitelist()
-def get_supplier_requests():
+def get_supplier_requests(page=1, page_size=25, status=None):
     """Get all requests for the current supplier"""
     user = frappe.session.user
     if user == "Guest":
@@ -489,23 +553,33 @@ def get_supplier_requests():
         if not supplier:
             frappe.throw(_("Supplier not found for this user"), frappe.PermissionError)
         
-        print(f"🔍 Getting requests for supplier: {supplier}")
-        
-        # Get requests for this supplier with PO number
+        page_no = _coerce_page(page, default=1)
+        page_len = _coerce_page_size(page_size, default=25, max_size=100)
+        offset = (page_no - 1) * page_len
+
+        filters = {"supplier": supplier}
+        status_values = _parse_status_filters(status)
+        if status_values:
+            filters["status"] = ["in", status_values]
+
+        total = int(frappe.db.count("Request", filters=filters) or 0)
+
         requests = frappe.get_all("Request", 
-            filters={"supplier": supplier},
+            filters=filters,
             fields=[
                 "name", "customer", "supplier", "request_type", "status", 
                 "creation", "response_message", "shared_plots_json", 
                 "message", "requested_by", "responded_by",
                 "purchase_order_number"  # ✅ Add this field
             ],
-            order_by="creation desc"
+            order_by="creation desc",
+            limit_start=offset,
+            limit_page_length=page_len,
         )
-        
-        print(f"📊 Found {len(requests)} requests for supplier {supplier}")
-        
-        return {"requests": requests}
+        return {
+            "requests": requests,
+            "pagination": _build_pagination(page_no, page_len, total),
+        }
         
     except Exception as e:
         print(f"Error in get_supplier_requests: {str(e)}")

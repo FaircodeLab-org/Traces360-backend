@@ -1,6 +1,36 @@
 import frappe
 from frappe import _
 
+
+def _coerce_page(value, default=1):
+    try:
+        page = int(value)
+        return page if page > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_page_size(page_size=None, fallback_limit=100, default=25, max_size=100):
+    candidate = page_size if page_size is not None else fallback_limit
+    try:
+        size = int(candidate)
+    except (TypeError, ValueError):
+        size = default
+    if size <= 0:
+        size = default
+    return min(size, max_size)
+
+
+def _build_pagination(page, page_size, total):
+    total_pages = (total + page_size - 1) // page_size if page_size else 0
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+    }
+
+
 @frappe.whitelist()
 def create_supplier_with_user(name, email, country=None):
     """
@@ -76,7 +106,7 @@ def toggle_supplier_access(supplier_name, enable=0):
 
 
 @frappe.whitelist()
-def get_suppliers(search=None, limit=100):
+def get_suppliers(search=None, limit=100, page=1, page_size=None):
     """
     Get suppliers linked to a User, including their email and enabled status.
     """
@@ -84,11 +114,9 @@ def get_suppliers(search=None, limit=100):
     if user == "Guest":
         frappe.throw(_("Not logged in"), frappe.PermissionError)
 
-    # Safe limit
-    try:
-        page_limit = min(int(limit), 500) if limit else 100
-    except (ValueError, TypeError):
-        page_limit = 100
+    page_no = _coerce_page(page, default=1)
+    page_limit = _coerce_page_size(page_size=page_size, fallback_limit=limit, default=25, max_size=100)
+    offset = (page_no - 1) * page_limit
 
     # Prepare search condition
     search_condition = ""
@@ -106,7 +134,7 @@ def get_suppliers(search=None, limit=100):
     # SQL Query with Join to get User details (email, enabled status)
     # We filter by s.disabled = 0 (Supplier doctype status)
     # We DO NOT filter by u.enabled so we can see disabled users in the list
-    query = f"""
+    base_from_where = f"""
         SELECT 
             s.name, 
             s.supplier_name, 
@@ -121,8 +149,26 @@ def get_suppliers(search=None, limit=100):
             AND s.custom_user IS NOT NULL 
             AND s.custom_user != ''
             {search_condition}
+    """
+
+    count_query = f"""
+        SELECT COUNT(*) AS total
+        FROM `tabSupplier` s
+        JOIN `tabUser` u ON s.custom_user = u.name
+        WHERE 
+            s.disabled = 0
+            AND s.custom_user IS NOT NULL 
+            AND s.custom_user != ''
+            {search_condition}
+    """
+    total_row = frappe.db.sql(count_query, params, as_dict=True) or []
+    total = int((total_row[0] or {}).get("total") or 0)
+
+    query = f"""
+        {base_from_where}
         ORDER BY s.supplier_name ASC
         LIMIT {page_limit}
+        OFFSET {offset}
     """
 
     data = frappe.db.sql(query, params, as_dict=True)
@@ -295,4 +341,7 @@ def get_suppliers(search=None, limit=100):
             }
         )
     
-    return {"suppliers": suppliers}
+    return {
+        "suppliers": suppliers,
+        "pagination": _build_pagination(page_no, page_limit, total),
+    }

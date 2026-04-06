@@ -12,6 +12,34 @@ CHOICE_INPUT_TYPES = {"Multiple Choice", "Checkbox", "Dropdown"}
 SECTION_INPUT_TYPE = "Section"
 
 
+def _coerce_page(value, default=1):
+    try:
+        page = int(value)
+        return page if page > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_page_size(value, default=25, max_size=100):
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        size = default
+    if size <= 0:
+        size = default
+    return min(size, max_size)
+
+
+def _build_pagination(page, page_size, total):
+    total_pages = (total + page_size - 1) // page_size if page_size else 0
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+    }
+
+
 # Reuse your helper from requests.py if available
 try:
     from farmportal.api.requests import _get_party_from_user  # (customer, supplier)
@@ -326,7 +354,7 @@ def create_questionnaire(supplier_id: str = None, title: str = None, questions: 
 
 
 @frappe.whitelist()
-def list_for_me(status: str | None = None):
+def list_for_me(status: str | None = None, page=1, page_size=25):
     """
     List questionnaires for the logged-in user.
     
@@ -357,6 +385,12 @@ def list_for_me(status: str | None = None):
     if status:
         filters["status"] = status
 
+    page_no = _coerce_page(page, default=1)
+    page_len = _coerce_page_size(page_size, default=25, max_size=100)
+    offset = (page_no - 1) * page_len
+
+    total = int(frappe.db.count(DT, filters=filters) or 0)
+
     rows = frappe.get_all(
         DT,
         filters=filters,
@@ -365,13 +399,18 @@ def list_for_me(status: str | None = None):
             "due_date", "creation", "modified", "responded_by", "submitted_on"
         ],
         order_by="creation desc",
-        limit_page_length=200
+        limit_start=offset,
+        limit_page_length=page_len,
     )
-    return {"items": rows, "role": role}
+    return {
+        "items": rows,
+        "role": role,
+        "pagination": _build_pagination(page_no, page_len, total),
+    }
 
 
 @frappe.whitelist()
-def list_templates():
+def list_templates(page=1, page_size=25):
     user = frappe.session.user
     if user == "Guest":
         frappe.throw(_t("Not logged in"), frappe.PermissionError)
@@ -379,33 +418,56 @@ def list_templates():
     customer = _resolve_customer_for_user(user)
     is_manager = _is_system_manager(user)
 
+    page_no = _coerce_page(page, default=1)
+    page_len = _coerce_page_size(page_size, default=25, max_size=100)
+    offset = (page_no - 1) * page_len
+
+    filters = {"is_active": 1}
+    or_filters = None
+
+    if not is_manager:
+        if customer:
+            or_filters = [
+                [TEMPLATE_DT, "is_public", "=", 1],
+                [TEMPLATE_DT, "customer", "=", customer],
+            ]
+        else:
+            filters["is_public"] = 1
+
+    total_rows = frappe.get_all(
+        TEMPLATE_DT,
+        fields=["count(name) as total"],
+        filters=filters,
+        or_filters=or_filters,
+    )
+    total = int((total_rows[0] or {}).get("total") or 0) if total_rows else 0
     rows = frappe.get_all(
         TEMPLATE_DT,
         fields=[
             "name as id", "title", "description", "customer",
             "created_by", "is_public", "is_active", "modified"
         ],
-        filters={"is_active": 1},
+        filters=filters,
+        or_filters=or_filters,
         order_by="modified desc",
-        limit_page_length=500
+        limit_start=offset,
+        limit_page_length=page_len,
     )
 
-    items = []
-    for row in rows:
-        is_public = int(row.get("is_public") or 0)
-        is_owner = bool(customer and row.get("customer") == customer)
-        if is_manager or is_public or is_owner:
-            items.append({
-                "id": row.get("id"),
-                "title": row.get("title"),
-                "description": row.get("description") or "",
-                "customer": row.get("customer"),
-                "created_by": row.get("created_by"),
-                "is_public": is_public,
-                "modified": row.get("modified"),
-            })
+    items = [{
+        "id": row.get("id"),
+        "title": row.get("title"),
+        "description": row.get("description") or "",
+        "customer": row.get("customer"),
+        "created_by": row.get("created_by"),
+        "is_public": int(row.get("is_public") or 0),
+        "modified": row.get("modified"),
+    } for row in rows]
 
-    return {"items": items}
+    return {
+        "items": items,
+        "pagination": _build_pagination(page_no, page_len, total),
+    }
 
 
 @frappe.whitelist()
