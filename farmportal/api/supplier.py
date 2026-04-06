@@ -31,6 +31,81 @@ def _build_pagination(page, page_size, total):
     }
 
 
+def _normalize_email(value):
+    return (value or "").strip().lower()
+
+
+def _resolve_user_name(value):
+    if not value:
+        return None
+
+    raw_value = str(value).strip()
+    if not raw_value:
+        return None
+
+    if frappe.db.exists("User", raw_value):
+        return raw_value
+
+    user_from_username = frappe.db.get_value("User", {"username": raw_value}, "name")
+    if user_from_username:
+        return user_from_username
+
+    email_norm = _normalize_email(raw_value)
+    if not email_norm:
+        return None
+
+    if frappe.db.exists("User", email_norm):
+        return email_norm
+
+    user_from_username = frappe.db.get_value("User", {"username": email_norm}, "name")
+    if user_from_username:
+        return user_from_username
+
+    return frappe.db.get_value("User", {"email": email_norm}, "name")
+
+
+def _get_supplier_member_user_ids(supplier_name):
+    """
+    Resolve User IDs for supplier members from the Supplier User child table.
+    """
+    if not supplier_name:
+        return []
+
+    try:
+        meta = frappe.get_meta("Supplier User")
+    except Exception:
+        return []
+
+    fields = ["name"]
+    candidate_fields = []
+    for fieldname in ("user_link", "user", "email"):
+        if meta.has_field(fieldname):
+            fields.append(fieldname)
+            candidate_fields.append(fieldname)
+
+    if not candidate_fields:
+        return []
+
+    rows = frappe.get_all(
+        "Supplier User",
+        filters={
+            "parenttype": "Supplier",
+            "parent": supplier_name,
+        },
+        fields=fields,
+        limit_page_length=500,
+    )
+
+    user_ids = []
+    for row in rows:
+        for fieldname in candidate_fields:
+            resolved = _resolve_user_name(row.get(fieldname))
+            if resolved and resolved not in user_ids:
+                user_ids.append(resolved)
+
+    return user_ids
+
+
 @frappe.whitelist()
 def create_supplier_with_user(name, email, country=None):
     """
@@ -83,26 +158,47 @@ def create_supplier_with_user(name, email, country=None):
 @frappe.whitelist()
 def toggle_supplier_access(supplier_name, enable=0):
     """
-    Disables or Enables the User linked to the Supplier.
+    Disable/Enable login access for the Supplier owner and all supplier members.
     enable: 0 to disable, 1 to enable
     """
     if not supplier_name:
         frappe.throw(_("Supplier Name is required"))
 
     supplier = frappe.get_doc("Supplier", supplier_name)
-    
-    if not supplier.custom_user:
+
+    owner_user = _resolve_user_name(supplier.get("custom_user"))
+    if not owner_user:
         frappe.throw(_("This supplier is not linked to a User account"))
 
-    user = frappe.get_doc("User", supplier.custom_user)
-    
-    # Toggle enabled status
-    user.enabled = int(enable)
-    user.save(ignore_permissions=True)
+    enable_flag = 1 if int(enable) else 0
+
+    user_ids = [owner_user]
+    for member_user in _get_supplier_member_user_ids(supplier.name):
+        if member_user not in user_ids:
+            user_ids.append(member_user)
+
+    updated_users = []
+    skipped_users = []
+    for user_id in user_ids:
+        if user_id in ("Administrator", "Guest"):
+            skipped_users.append(user_id)
+            continue
+        if not frappe.db.exists("User", user_id):
+            skipped_users.append(user_id)
+            continue
+        frappe.db.set_value("User", user_id, "enabled", enable_flag, update_modified=False)
+        updated_users.append(user_id)
+
+    frappe.cache.delete_key("enabled_users")
     frappe.db.commit()
 
-    status = "Enabled" if user.enabled else "Disabled"
-    return {"message": f"Supplier access {status}", "enabled": user.enabled}
+    status = "Enabled" if enable_flag else "Disabled"
+    return {
+        "message": f"Supplier access {status}",
+        "enabled": enable_flag,
+        "updated_users_count": len(updated_users),
+        "skipped_users_count": len(skipped_users),
+    }
 
 
 @frappe.whitelist()
