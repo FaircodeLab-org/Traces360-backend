@@ -10,7 +10,16 @@ fixtures = [
         "dt": "Custom Field",
         "filters": [
             ["dt", "in", ["Supplier", "Customer"]],
-            ["fieldname", "=", "custom_user"],
+            [
+                "fieldname",
+                "in",
+                [
+                    "custom_user",
+                    "custom_verification_status",
+                    "custom_section_break_9d28u",
+                    "custom_members",
+                ],
+            ],
         ],
     },
     {
