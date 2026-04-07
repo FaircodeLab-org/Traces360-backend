@@ -392,6 +392,35 @@ def _collect_pending_risk_plot_names(customer: str, analyzed_plot_names: set[str
     pending.sort()
     return pending
 
+
+def _collect_customer_shared_plot_names(customer: str) -> list[str]:
+    """Collect unique plot docnames shared with a customer across requests."""
+    query = """
+        SELECT r.name, r.supplier, r.shared_plots_json, r.purchase_order_data
+        FROM `tabRequest` r
+        WHERE r.customer = %s
+        AND (
+            (r.shared_plots_json IS NOT NULL AND r.shared_plots_json != '')
+            OR (r.purchase_order_data IS NOT NULL AND r.purchase_order_data != '')
+        )
+    """
+    requests_with_plots = frappe.db.sql(query, (customer,), as_dict=True)
+
+    matched_names = set()
+    for req in requests_with_plots:
+        refs = _parse_request_plot_ids(req)
+        if not refs:
+            continue
+        supplier_name = str(req.get("supplier") or "").strip()
+        if not supplier_name:
+            continue
+        resolved = _resolve_supplier_plot_names(supplier_name, refs)
+        matched_names.update(resolved)
+
+    names = [str(name).strip() for name in matched_names if str(name).strip()]
+    names.sort()
+    return names
+
 def _as_list(val):
     if not val:
         return []
@@ -1003,7 +1032,13 @@ def get_dashboard_stats():
 
 
     # Optional extras (safe if doctypes don’t exist)
-    land_plots = _count_if_exists("Land Plot", filters)
+    if role == "supplier":
+        land_plots = _count_if_exists("Land Plot", filters)
+    else:
+        try:
+            land_plots = len(_collect_customer_shared_plot_names(customer))
+        except Exception:
+            land_plots = 0
     products = _count_if_exists("Item", {"disabled": 0}) if role == "supplier" else 0
 
     compliance_rate = round((completed / total * 100), 0) if total else 0
