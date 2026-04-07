@@ -5,6 +5,13 @@ import frappe
 from frappe import _
 from frappe.utils import now_datetime, get_datetime
 from urllib.parse import urlparse
+from farmportal.api.organization_profile import (
+    _get_customer_permission_context,
+    _get_supplier_permission_context,
+    _require_supplier_permission,
+    SUPPLIER_PERMISSION_PLOT_MANAGER,
+    SUPPLIER_PERMISSION_PURCHASE_ORDER_MANAGER,
+)
 
 DT = "Request"
 RISK_ANALYSIS_CACHE_VERSION = "hansen_sentinel_area_v2"
@@ -14,6 +21,46 @@ USER_LINK_FIELDS = {
     "Customer": ["custom_user", "user_id", "user"],
     "Supplier": ["custom_user", "user_id", "user"],
 }
+
+
+def _require_customer_request_permission(user: str, customer_hint: str, request_type: str | None = None) -> dict:
+    context = _get_customer_permission_context(user, customer_hint)
+    permissions = context.get("permissions", {}) if context else {}
+    request_type_key = str(request_type or "").strip().lower()
+
+    if request_type_key == "purchase_order":
+        allowed = bool(permissions.get(SUPPLIER_PERMISSION_PURCHASE_ORDER_MANAGER))
+        message = _("You are not allowed to manage purchase order requests")
+    else:
+        allowed = bool(
+            permissions.get(SUPPLIER_PERMISSION_PURCHASE_ORDER_MANAGER)
+            or permissions.get(SUPPLIER_PERMISSION_PLOT_MANAGER)
+        )
+        message = _("You are not allowed to manage requests")
+
+    if not context.get("has_customer") or not allowed:
+        frappe.throw(message, frappe.PermissionError)
+    return context
+
+
+def _require_supplier_request_permission(user: str, supplier_hint: str, request_type: str | None = None) -> dict:
+    context = _get_supplier_permission_context(user, supplier_hint)
+    permissions = context.get("permissions", {}) if context else {}
+    request_type_key = str(request_type or "").strip().lower()
+
+    if request_type_key == "purchase_order":
+        allowed = bool(permissions.get(SUPPLIER_PERMISSION_PURCHASE_ORDER_MANAGER))
+        message = _("You are not allowed to manage purchase orders")
+    else:
+        allowed = bool(
+            permissions.get(SUPPLIER_PERMISSION_PURCHASE_ORDER_MANAGER)
+            or permissions.get(SUPPLIER_PERMISSION_PLOT_MANAGER)
+        )
+        message = _("You are not allowed to manage requests")
+
+    if not context.get("has_supplier") or not allowed:
+        frappe.throw(message, frappe.PermissionError)
+    return context
 
 
 def _coerce_page(value, default=1):
@@ -322,24 +369,16 @@ def _collect_pending_risk_plot_names(customer: str, analyzed_plot_names: set[str
     """
     requests_with_plots = frappe.db.sql(query, (customer,), as_dict=True)
 
-    all_plot_ids = []
-    for req in requests_with_plots:
-        all_plot_ids.extend(_parse_request_plot_ids(req))
-
-    if not all_plot_ids:
-        return []
-
-    plot_meta = frappe.get_meta("Land Plot")
-    has_plot_id = plot_meta.has_field("plot_id")
-
     matched_names = set()
-    by_name = frappe.get_all("Land Plot", filters={"name": ["in", all_plot_ids]}, fields=["name"])
-    matched_names.update([p.name for p in by_name])
-
-    unresolved_ids = [pid for pid in all_plot_ids if pid not in matched_names]
-    if has_plot_id and unresolved_ids:
-        by_plot_id = frappe.get_all("Land Plot", filters={"plot_id": ["in", unresolved_ids]}, fields=["name"])
-        matched_names.update([p.name for p in by_plot_id])
+    for req in requests_with_plots:
+        refs = _parse_request_plot_ids(req)
+        if not refs:
+            continue
+        supplier_name = str(req.get("supplier") or "").strip()
+        if not supplier_name:
+            continue
+        resolved = _resolve_supplier_plot_names(supplier_name, refs)
+        matched_names.update(resolved)
 
     if not matched_names:
         return []
@@ -506,6 +545,7 @@ def get_customer_requests(page=1, page_size=25, status=None):
         customer, supplier = _get_party_from_user(user)
         if not customer:
             frappe.throw(_("Customer not found for this user"), frappe.PermissionError)
+        _require_customer_request_permission(user, customer)
         
         page_no = _coerce_page(page, default=1)
         page_len = _coerce_page_size(page_size, default=25, max_size=100)
@@ -535,6 +575,8 @@ def get_customer_requests(page=1, page_size=25, status=None):
             "pagination": _build_pagination(page_no, page_len, total),
         }
         
+    except frappe.PermissionError:
+        raise
     except Exception as e:
         print(f"Error in get_customer_requests: {str(e)}")
         frappe.log_error(frappe.get_traceback(), "get_customer_requests error")
@@ -552,6 +594,7 @@ def get_supplier_requests(page=1, page_size=25, status=None):
         customer, supplier = _get_party_from_user(user)
         if not supplier:
             frappe.throw(_("Supplier not found for this user"), frappe.PermissionError)
+        _require_supplier_request_permission(user, supplier)
         
         page_no = _coerce_page(page, default=1)
         page_len = _coerce_page_size(page_size, default=25, max_size=100)
@@ -581,6 +624,8 @@ def get_supplier_requests(page=1, page_size=25, status=None):
             "pagination": _build_pagination(page_no, page_len, total),
         }
         
+    except frappe.PermissionError:
+        raise
     except Exception as e:
         print(f"Error in get_supplier_requests: {str(e)}")
         frappe.log_error(frappe.get_traceback(), "get_supplier_requests error")
@@ -647,6 +692,7 @@ def create_request(supplier_id, request_type, message=None, purchase_order_numbe
         customer, supplier = _get_party_from_user(user)
         if not customer:
             frappe.throw(_("Customer not found for this user"), frappe.PermissionError)
+        _require_customer_request_permission(user, customer, request_type=request_type)
 
         # Validate required fields
         if not supplier_id:
@@ -662,9 +708,14 @@ def create_request(supplier_id, request_type, message=None, purchase_order_numbe
         if purchase_order_number:
             print(f"📦 Purchase Order Number: {purchase_order_number}")
 
+        # Do not allow tenant override of customer from request payload.
+        # The authenticated user context determines ownership.
+        if customer_id and str(customer_id).strip() and str(customer_id).strip() != str(customer):
+            frappe.throw(_("Not allowed to create requests for another importer"), frappe.PermissionError)
+
         # Create the request document
         doc = frappe.new_doc("Request")
-        doc.customer = customer_id or customer  # Allow override for admin
+        doc.customer = customer
         doc.supplier = supplier_id
         doc.request_type = request_type
         doc.message = message or ""
@@ -718,6 +769,8 @@ def create_request(supplier_id, request_type, message=None, purchase_order_numbe
             "message": _("Request created successfully"),
         }
 
+    except frappe.PermissionError:
+        raise
     except Exception as e:
         print(f"❌ Error creating request: {str(e)}")
         frappe.log_error(frappe.get_traceback(), "create_request error")
@@ -840,6 +893,16 @@ def respond_to_request(request_id, action=None, message=None, shared_plots=None,
 
     if doc.supplier != supplier:
         frappe.throw(_("Not permitted to respond to this request"), frappe.PermissionError)
+    _require_supplier_request_permission(user, supplier, request_type=doc.get("request_type"))
+
+    request_type = str(doc.get("request_type") or "").strip().lower()
+    if request_type == "purchase_order":
+        _require_supplier_permission(
+            user,
+            SUPPLIER_PERMISSION_PURCHASE_ORDER_MANAGER,
+            supplier_hint=supplier,
+            message=_("You are not allowed to manage purchase orders"),
+        )
 
     # --- Normalize inputs ---
     a = (action or "").strip().lower()
@@ -1028,6 +1091,7 @@ def get_supplier_land_plots():
     customer, supplier = _get_party_from_user(user)
     if not supplier:
         frappe.throw(_("Only Suppliers can access land plots"), frappe.PermissionError)
+    _require_supplier_request_permission(user, supplier)
 
     try:
         # Get land plots for this supplier - REMOVED 'products' field
@@ -1178,6 +1242,18 @@ def get_shared_plots(request_id):
         customer, supplier = _get_party_from_user(user)
         if request_doc.customer != customer and request_doc.supplier != supplier:
             frappe.throw(_("Not permitted to view this request"), frappe.PermissionError)
+        if request_doc.customer == customer:
+            _require_customer_request_permission(
+                user,
+                customer,
+                request_type=request_doc.get("request_type"),
+            )
+        elif request_doc.supplier == supplier:
+            _require_supplier_request_permission(
+                user,
+                supplier,
+                request_type=request_doc.get("request_type"),
+            )
 
         plot_ids = []
 
@@ -1369,6 +1445,7 @@ def respond_to_request(request_id, action=None, message=None, shared_plots=None,
 
     if doc.supplier != supplier:
         frappe.throw(_("Not permitted to respond to this request"), frappe.PermissionError)
+    _require_supplier_request_permission(user, supplier, request_type=doc.get("request_type"))
 
     # Simple status update
     if action == "accept":
@@ -1565,7 +1642,7 @@ def get_risk_dashboard_data():
                     )
                     if not plots and has_plot_id:
                         plots = frappe.get_all("Land Plot", 
-                            filters={"plot_id": ["in", plot_ids]},
+                            filters={"supplier": request.supplier, "plot_id": ["in", plot_ids]},
                             fields=plot_fields
                         )
 
@@ -2352,6 +2429,7 @@ def get_purchase_order_details(request_id):
         customer, supplier = _get_party_from_user(user)
         if not supplier:
             frappe.throw(_("Only Suppliers can access PO details"), frappe.PermissionError)
+        _require_supplier_request_permission(user, supplier, request_type="purchase_order")
 
         # Get the request details
         request_doc = frappe.get_doc("Request", request_id)
@@ -2445,6 +2523,12 @@ def submit_purchase_order_data(request_id, po_data):
         customer, supplier = _get_party_from_user(user)
         if not supplier:
             frappe.throw(_("Only Suppliers can submit PO data"), frappe.PermissionError)
+        _require_supplier_permission(
+            user,
+            SUPPLIER_PERMISSION_PURCHASE_ORDER_MANAGER,
+            supplier_hint=supplier,
+            message=_("You are not allowed to manage purchase orders"),
+        )
 
         # Parse the PO data
         if isinstance(po_data, str):
@@ -2546,7 +2630,11 @@ def get_purchase_order_response(request_id):
         request_doc = frappe.get_doc("Request", request_id)
         
         # Check permissions - customer or supplier can view
-        if request_doc.customer != customer and request_doc.supplier != supplier:
+        if request_doc.customer == customer:
+            _require_customer_request_permission(user, customer, request_type="purchase_order")
+        elif request_doc.supplier == supplier:
+            _require_supplier_request_permission(user, supplier, request_type="purchase_order")
+        else:
             frappe.throw(_("Not authorized to view this request"), frappe.PermissionError)
 
         if request_doc.request_type != "purchase_order":
@@ -2631,7 +2719,7 @@ def get_purchase_order_response(request_id):
             if not plots and has_plot_id:
                 plots = frappe.get_all(
                     "Land Plot",
-                    filters={"plot_id": ["in", plot_ids]},
+                    filters={"supplier": request_doc.supplier, "plot_id": ["in", plot_ids]},
                     fields=fields
                 )
 
@@ -2759,6 +2847,7 @@ def get_customer_purchase_order_plots(request_id):
         # Only the customer of this request can view
         if request_doc.customer != customer:
             frappe.throw(_("Not authorized to view this request"), frappe.PermissionError)
+        _require_customer_request_permission(user, customer, request_type="purchase_order")
 
         if request_doc.request_type != "purchase_order":
             frappe.throw(_("This is not a purchase order request"))

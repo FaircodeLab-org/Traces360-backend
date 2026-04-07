@@ -319,6 +319,10 @@ import uuid
 import tempfile
 from datetime import datetime
 from frappe import _
+from farmportal.api.organization_profile import (
+    _require_supplier_permission,
+    SUPPLIER_PERMISSION_PLOT_MANAGER,
+)
 
 DEFAULT_SINGLE_POINT_RADIUS_M = 100.0
 _EE_READY = False
@@ -952,6 +956,12 @@ def create_land_plot(plot_data, calculate_deforestation=True):
     customer, supplier = _get_party_from_user(user)
     if not supplier:
         frappe.throw(_("Only Suppliers can create land plots"), frappe.PermissionError)
+    _require_supplier_permission(
+        user,
+        SUPPLIER_PERMISSION_PLOT_MANAGER,
+        supplier_hint=supplier,
+        message=_("You are not allowed to manage land plots"),
+    )
 
     data = json.loads(plot_data) if isinstance(plot_data, str) else plot_data
     result = create_single_plot_internal(data, supplier, calculate_deforestation)
@@ -968,6 +978,12 @@ def update_land_plot(name, plot_data, recalculate_deforestation=False):
     customer, supplier = _get_party_from_user(user)
     if not supplier:
         frappe.throw(_("Only Suppliers can update land plots"), frappe.PermissionError)
+    _require_supplier_permission(
+        user,
+        SUPPLIER_PERMISSION_PLOT_MANAGER,
+        supplier_hint=supplier,
+        message=_("You are not allowed to manage land plots"),
+    )
 
     data = json.loads(plot_data) if isinstance(plot_data, str) else plot_data
     
@@ -1032,6 +1048,12 @@ def bulk_create_land_plots(plots_data, calculate_deforestation=True):
     customer, supplier = _get_party_from_user(user)
     if not supplier:
         frappe.throw(_("Only Suppliers can create land plots"), frappe.PermissionError)
+    _require_supplier_permission(
+        user,
+        SUPPLIER_PERMISSION_PLOT_MANAGER,
+        supplier_hint=supplier,
+        message=_("You are not allowed to manage land plots"),
+    )
 
     plots = json.loads(plots_data) if isinstance(plots_data, str) else plots_data
     created_plots = []
@@ -1081,6 +1103,12 @@ def recalculate_deforestation(plot_name):
     customer, supplier = _get_party_from_user(user)
     if not supplier:
         frappe.throw(_("Only Suppliers can update land plots"), frappe.PermissionError)
+    _require_supplier_permission(
+        user,
+        SUPPLIER_PERMISSION_PLOT_MANAGER,
+        supplier_hint=supplier,
+        message=_("You are not allowed to manage land plots"),
+    )
 
     doc = frappe.get_doc("Land Plot", plot_name)
     
@@ -1123,6 +1151,12 @@ def delete_land_plot(name):
     customer, supplier = _get_party_from_user(user)
     if not supplier:
         frappe.throw(_("Only Suppliers can delete land plots"), frappe.PermissionError)
+    _require_supplier_permission(
+        user,
+        SUPPLIER_PERMISSION_PLOT_MANAGER,
+        supplier_hint=supplier,
+        message=_("You are not allowed to manage land plots"),
+    )
 
     # ✅ Add ignore_permissions=True to bypass doctype-level permission check
     doc = frappe.get_doc("Land Plot", name)
@@ -1148,6 +1182,12 @@ def delete_land_plot(name):
     customer, supplier = _get_party_from_user(user)
     if not supplier:
         frappe.throw(_("Only Suppliers can delete land plots"), frappe.PermissionError)
+    _require_supplier_permission(
+        user,
+        SUPPLIER_PERMISSION_PLOT_MANAGER,
+        supplier_hint=supplier,
+        message=_("You are not allowed to manage land plots"),
+    )
 
     # ✅ Add ignore_permissions=True to bypass doctype-level permission check
     doc = frappe.get_doc("Land Plot", name)
@@ -1174,6 +1214,12 @@ def begin_import():
     customer, supplier = _get_party_from_user(user)
     if not supplier:
         frappe.throw(_("Only Suppliers can upload"), frappe.PermissionError)
+    _require_supplier_permission(
+        user,
+        SUPPLIER_PERMISSION_PLOT_MANAGER,
+        supplier_hint=supplier,
+        message=_("You are not allowed to manage land plots"),
+    )
 
     doc = frappe.get_doc({
         "doctype": "Land Plot Import",
@@ -1210,6 +1256,12 @@ def get_hubtrace_surveys():
     customer, supplier = _get_party_from_user(user)
     if not supplier:
         frappe.throw(_("Only Suppliers can import surveys"), frappe.PermissionError)
+    _require_supplier_permission(
+        user,
+        SUPPLIER_PERMISSION_PLOT_MANAGER,
+        supplier_hint=supplier,
+        message=_("You are not allowed to manage land plots"),
+    )
 
     existing_plot_ids = set(
         frappe.get_all("Land Plot", filters={"supplier": supplier}, pluck="plot_id") or []
@@ -1267,6 +1319,12 @@ def import_hubtrace_survey(survey_name: str):
     customer, supplier = _get_party_from_user(user)
     if not supplier:
         frappe.throw(_("Only Suppliers can import surveys"), frappe.PermissionError)
+    _require_supplier_permission(
+        user,
+        SUPPLIER_PERMISSION_PLOT_MANAGER,
+        supplier_hint=supplier,
+        message=_("You are not allowed to manage land plots"),
+    )
 
     if not survey_name:
         frappe.throw(_("survey_name is required"))

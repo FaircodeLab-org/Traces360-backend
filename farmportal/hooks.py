@@ -44,6 +44,9 @@ fixtures = [
 doc_events = {
     "Supplier": {
         "validate": "farmportal.api.organization_profile.manage_organization_users"
+    },
+    "Customer": {
+        "validate": "farmportal.api.organization_profile.manage_organization_users"
     }
 }
 

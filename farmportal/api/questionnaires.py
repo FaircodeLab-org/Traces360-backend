@@ -3,6 +3,14 @@ import json
 import frappe
 from frappe import _ as _t
 from frappe.utils.file_manager import save_file
+from farmportal.api.organization_profile import (
+    _get_customer_permission_context,
+    _get_supplier_permission_context,
+    _require_customer_permission,
+    _require_supplier_permission,
+    SUPPLIER_PERMISSION_OWN_QUESTIONNAIRES,
+    SUPPLIER_PERMISSION_QUESTIONNAIRE_MANAGER,
+)
 
 DT = "Questionnaire"
 CHILD_DT = "Questionnaire Question"
@@ -317,6 +325,12 @@ def create_questionnaire(supplier_id: str = None, title: str = None, questions: 
         frappe.throw(_t("No Customer linked to your user ({0})").format(user), frappe.PermissionError)
     if supplier_flag and not customer:
         frappe.throw(_t("Suppliers cannot create questionnaires"), frappe.PermissionError)
+    _require_customer_permission(
+        user,
+        SUPPLIER_PERMISSION_QUESTIONNAIRE_MANAGER,
+        customer_hint=customer,
+        message=_t("You are not allowed to manage questionnaires"),
+    )
 
     if not supplier_id:
         frappe.throw(_t("Supplier is required"))
@@ -373,12 +387,28 @@ def list_for_me(status: str | None = None, page=1, page_size=25):
     filters = {}
     role = None
     
+    supplier_permission_ctx = None
+    customer_permission_ctx = None
     if supplier and not customer:
         role = "supplier"
         filters["supplier"] = supplier
+        supplier_permission_ctx = _get_supplier_permission_context(user, supplier)
+        supplier_permissions = supplier_permission_ctx.get("permissions", {})
+        if not (
+            supplier_permissions.get(SUPPLIER_PERMISSION_QUESTIONNAIRE_MANAGER)
+            or supplier_permissions.get(SUPPLIER_PERMISSION_OWN_QUESTIONNAIRES)
+        ):
+            frappe.throw(_t("You are not allowed to access questionnaires"), frappe.PermissionError)
     elif customer:
         role = "customer"
         filters["customer"] = customer
+        customer_permission_ctx = _get_customer_permission_context(user, customer)
+        customer_permissions = customer_permission_ctx.get("permissions", {})
+        if not (
+            customer_permissions.get(SUPPLIER_PERMISSION_QUESTIONNAIRE_MANAGER)
+            or customer_permissions.get(SUPPLIER_PERMISSION_OWN_QUESTIONNAIRES)
+        ):
+            frappe.throw(_t("You are not allowed to access questionnaires"), frappe.PermissionError)
     else:
         return {"items": [], "role": None}
 
@@ -405,6 +435,16 @@ def list_for_me(status: str | None = None, page=1, page_size=25):
     return {
         "items": rows,
         "role": role,
+        "member_permissions": (
+            supplier_permission_ctx.get("permissions", {})
+            if supplier_permission_ctx
+            else customer_permission_ctx.get("permissions", {}) if customer_permission_ctx else {}
+        ),
+        "member_role": (
+            supplier_permission_ctx.get("member_role", "viewer")
+            if supplier_permission_ctx
+            else customer_permission_ctx.get("member_role", "viewer") if customer_permission_ctx else ""
+        ),
         "pagination": _build_pagination(page_no, page_len, total),
     }
 
@@ -417,6 +457,13 @@ def list_templates(page=1, page_size=25):
 
     customer = _resolve_customer_for_user(user)
     is_manager = _is_system_manager(user)
+    if customer and not is_manager:
+        _require_customer_permission(
+            user,
+            SUPPLIER_PERMISSION_QUESTIONNAIRE_MANAGER,
+            customer_hint=customer,
+            message=_t("You are not allowed to manage questionnaire templates"),
+        )
 
     page_no = _coerce_page(page, default=1)
     page_len = _coerce_page_size(page_size, default=25, max_size=100)
@@ -480,6 +527,13 @@ def get_template(template_id: str):
 
     customer = _resolve_customer_for_user(user)
     is_manager = _is_system_manager(user)
+    if customer and not is_manager:
+        _require_customer_permission(
+            user,
+            SUPPLIER_PERMISSION_QUESTIONNAIRE_MANAGER,
+            customer_hint=customer,
+            message=_t("You are not allowed to manage questionnaire templates"),
+        )
 
     doc = frappe.get_doc(TEMPLATE_DT, template_id)
     _ensure_template_access(doc, customer, is_manager)
@@ -539,6 +593,13 @@ def save_template(
     is_manager = _is_system_manager(user)
     if not customer and not is_manager:
         frappe.throw(_t("Only importer/customer users can manage templates"), frappe.PermissionError)
+    if customer and not is_manager:
+        _require_customer_permission(
+            user,
+            SUPPLIER_PERMISSION_QUESTIONNAIRE_MANAGER,
+            customer_hint=customer,
+            message=_t("You are not allowed to manage questionnaire templates"),
+        )
 
     qlist = _as_list(questions)
     _validate_question_payload(qlist)
@@ -604,6 +665,12 @@ def create_questionnaire_from_template(
     customer = _resolve_customer_for_user(user)
     if not customer:
         frappe.throw(_t("No Customer linked to your user ({0})").format(user), frappe.PermissionError)
+    _require_customer_permission(
+        user,
+        SUPPLIER_PERMISSION_QUESTIONNAIRE_MANAGER,
+        customer_hint=customer,
+        message=_t("You are not allowed to manage questionnaires"),
+    )
 
     is_manager = _is_system_manager(user)
     template_doc = frappe.get_doc(TEMPLATE_DT, template_id)
@@ -663,6 +730,21 @@ def get_one(q_id: str):
     doc = frappe.get_doc(DT, q_id)
     customer, supplier = _get_party_from_user(user)
     is_manager = _is_system_manager(user)
+    if customer and not is_manager:
+        customer_permission_ctx = _get_customer_permission_context(user, customer)
+        customer_permissions = customer_permission_ctx.get("permissions", {})
+        has_questionnaire_access = bool(
+            customer_permissions.get(SUPPLIER_PERMISSION_QUESTIONNAIRE_MANAGER)
+            or customer_permissions.get(SUPPLIER_PERMISSION_OWN_QUESTIONNAIRES)
+        )
+        if not has_questionnaire_access:
+            frappe.throw(_t("You are not allowed to access questionnaires"), frappe.PermissionError)
+        if (
+            customer_permissions.get(SUPPLIER_PERMISSION_OWN_QUESTIONNAIRES)
+            and not customer_permissions.get(SUPPLIER_PERMISSION_QUESTIONNAIRE_MANAGER)
+            and str(doc.get("created_by") or "") != str(user)
+        ):
+            frappe.throw(_t("Not permitted to view this questionnaire"), frappe.PermissionError)
     if not is_manager and doc.customer != customer and doc.supplier != supplier:
         frappe.throw(_t("Not permitted to view this questionnaire"), frappe.PermissionError)
     
@@ -720,6 +802,12 @@ def upload_questionnaire_file(q_id: str, rowname: str):
     
     if not supplier or supplier != doc.supplier:
         frappe.throw(_t("Not permitted to upload files"), frappe.PermissionError)
+    _require_supplier_permission(
+        user,
+        SUPPLIER_PERMISSION_QUESTIONNAIRE_MANAGER,
+        supplier_hint=supplier,
+        message=_t("You are not allowed to manage questionnaires"),
+    )
 
     # Verify questionnaire is in editable state
     if doc.status not in ["Pending", "Draft"]:
@@ -801,6 +889,12 @@ def submit_answers(q_id: str = None, answers: dict | str = None, message: str | 
     
     if not supplier or supplier != doc.supplier:
         frappe.throw(_t("Not permitted to respond"), frappe.PermissionError)
+    _require_supplier_permission(
+        user,
+        SUPPLIER_PERMISSION_QUESTIONNAIRE_MANAGER,
+        supplier_hint=supplier,
+        message=_t("You are not allowed to manage questionnaires"),
+    )
 
     # Parse answers - may arrive as JSON string, dict, "", or null
     amap = {}
@@ -883,6 +977,12 @@ def delete_questionnaire(q_id: str):
     
     if not customer or customer != doc.customer:
         frappe.throw(_t("Not permitted to delete"), frappe.PermissionError)
+    _require_customer_permission(
+        user,
+        SUPPLIER_PERMISSION_QUESTIONNAIRE_MANAGER,
+        customer_hint=customer,
+        message=_t("You are not allowed to manage questionnaires"),
+    )
     
     doc.delete(ignore_permissions=True)
     frappe.db.commit()
