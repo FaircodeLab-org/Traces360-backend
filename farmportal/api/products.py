@@ -1,7 +1,50 @@
-# my_app/my_app/api/products.py
 import frappe
 import json
 from typing import List, Dict
+
+
+def _coerce_start(value, default=0):
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(parsed, 0)
+
+
+def _coerce_page_length(value, default=200, max_size=500):
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+
+    if parsed <= 0:
+        parsed = default
+    return min(parsed, max_size)
+
+
+def _count_items(filters=None, or_filters=None):
+    rows = frappe.get_all(
+        "Item",
+        filters=filters or {},
+        or_filters=or_filters,
+        fields=["count(name) as total"],
+    )
+    if rows and rows[0].get("total") is not None:
+        return int(rows[0].get("total") or 0)
+    return 0
+
+
+def _build_meta(limit_start, limit_page_length, total, returned):
+    next_start = limit_start + returned if (limit_start + returned) < total else None
+    total_pages = (total + limit_page_length - 1) // limit_page_length if limit_page_length else 0
+    return {
+        "limit_start": limit_start,
+        "limit_page_length": limit_page_length,
+        "next_start": next_start,
+        "total": total,
+        "total_pages": total_pages,
+    }
+
 
 @frappe.whitelist()
 def get_products(search: str = None, limit_start: int = 0, limit_page_length: int = 200):
@@ -12,6 +55,9 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
     user = frappe.session.user
     if user == "Guest":
         frappe.throw("Not logged in", frappe.PermissionError)
+
+    limit_start = _coerce_start(limit_start, default=0)
+    limit_page_length = _coerce_page_length(limit_page_length, default=200, max_size=500)
 
     # Resolve current party
     from farmportal.api.requests import _get_party_from_user
@@ -27,6 +73,8 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
                 ["Item", "item_code", "like", like],
                 ["Item", "item_name", "like", like],
             ]
+
+        total = _count_items(filters=filters, or_filters=or_filters)
 
         items = frappe.get_all(
             "Item",
@@ -64,11 +112,7 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
         return {
             "message": f"Fetched {len(items)} EUDR Commodities products",
             "data": items,
-            "meta": {
-                "limit_start": limit_start,
-                "limit_page_length": limit_page_length,
-                "next_start": limit_start + len(items) if len(items) == limit_page_length else None,
-            },
+            "meta": _build_meta(limit_start, limit_page_length, total, len(items)),
         }
 
     req_filters = {}
@@ -80,11 +124,7 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
         return {
             "message": "No linked customer or supplier",
             "data": [],
-            "meta": {
-                "limit_start": limit_start,
-                "limit_page_length": limit_page_length,
-                "next_start": None,
-            },
+            "meta": _build_meta(limit_start, limit_page_length, 0, 0),
         }
 
     request_docs = frappe.get_all(
@@ -96,11 +136,7 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
         return {
             "message": "No requests found",
             "data": [],
-            "meta": {
-                "limit_start": limit_start,
-                "limit_page_length": limit_page_length,
-                "next_start": None,
-            },
+            "meta": _build_meta(limit_start, limit_page_length, 0, 0),
         }
 
     request_names = [r.get("name") for r in request_docs]
@@ -134,11 +170,7 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
         return {
             "message": "No requested products found",
             "data": [],
-            "meta": {
-                "limit_start": limit_start,
-                "limit_page_length": limit_page_length,
-                "next_start": None,
-            },
+            "meta": _build_meta(limit_start, limit_page_length, 0, 0),
         }
 
     requested_ids = list(requested_ids)
@@ -151,6 +183,8 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
             ["Item", "item_code", "like", like],
             ["Item", "item_name", "like", like],
         ]
+
+    total = _count_items(filters=filters, or_filters=or_filters)
 
     items: List[Dict] = frappe.get_all(
         "Item",
@@ -190,9 +224,5 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
     return {
         "message": f"Fetched {len(items)} requested products",
         "data": items,
-        "meta": {
-            "limit_start": limit_start,
-            "limit_page_length": limit_page_length,
-            "next_start": limit_start + len(items) if len(items) == limit_page_length else None,
-        },
+        "meta": _build_meta(limit_start, limit_page_length, total, len(items)),
     }

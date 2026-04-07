@@ -3,6 +3,36 @@ from frappe import _
 
 USER_LINK_FIELDS = ["custom_user", "user_id", "user"]
 
+
+def _coerce_page(value, default=1):
+    try:
+        page = int(value)
+        return page if page > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_page_size(page_size=None, fallback_limit=100, default=25, max_size=100):
+    candidate = page_size if page_size is not None else fallback_limit
+    try:
+        size = int(candidate)
+    except (TypeError, ValueError):
+        size = default
+    if size <= 0:
+        size = default
+    return min(size, max_size)
+
+
+def _build_pagination(page, page_size, total):
+    total_pages = (total + page_size - 1) // page_size if page_size else 0
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+    }
+
+
 def _get_buyer_user_field():
     meta = frappe.get_meta("Buyer")
     for fieldname in USER_LINK_FIELDS:
@@ -89,15 +119,14 @@ def toggle_buyer_access(buyer_name, enable=0):
 
 
 @frappe.whitelist()
-def get_buyers(search=None, limit=100):
+def get_buyers(search=None, limit=100, page=1, page_size=None):
     user = frappe.session.user
     if user == "Guest":
         frappe.throw(_("Not logged in"), frappe.PermissionError)
 
-    try:
-        page_limit = min(int(limit), 500) if limit else 100
-    except (ValueError, TypeError):
-        page_limit = 100
+    page_no = _coerce_page(page, default=1)
+    page_limit = _coerce_page_size(page_size=page_size, fallback_limit=limit, default=25, max_size=100)
+    offset = (page_no - 1) * page_limit
 
     user_field = _get_buyer_user_field()
     if not user_field:
@@ -118,7 +147,7 @@ def get_buyers(search=None, limit=100):
         """
         params["search"] = f"%{search}%"
 
-    query = f"""
+    base_from_where = f"""
         SELECT 
             b.name, 
             b.buyer_name, 
@@ -135,8 +164,25 @@ def get_buyers(search=None, limit=100):
             b.{user_field} IS NOT NULL 
             AND b.{user_field} != ''
             {search_condition}
+    """
+
+    count_query = f"""
+        SELECT COUNT(*) AS total
+        FROM `tabBuyer` b
+        JOIN `tabUser` u ON b.{user_field} = u.name
+        WHERE 
+            b.{user_field} IS NOT NULL 
+            AND b.{user_field} != ''
+            {search_condition}
+    """
+    total_row = frappe.db.sql(count_query, params, as_dict=True) or []
+    total = int((total_row[0] or {}).get("total") or 0)
+
+    query = f"""
+        {base_from_where}
         ORDER BY b.buyer_name ASC
         LIMIT {page_limit}
+        OFFSET {offset}
     """
 
     data = frappe.db.sql(query, params, as_dict=True)
@@ -157,4 +203,7 @@ def get_buyers(search=None, limit=100):
         for row in data
     ]
 
-    return {"buyers": buyers}
+    return {
+        "buyers": buyers,
+        "pagination": _build_pagination(page_no, page_limit, total),
+    }

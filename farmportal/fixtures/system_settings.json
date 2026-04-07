@@ -1,0 +1,13 @@
+[
+ {
+  "doctype": "System Settings",
+  "name": "System Settings",
+  "language": "en",
+  "time_zone": "Asia/Kolkata",
+  "date_format": "dd-mm-yyyy",
+  "time_format": "HH:mm:ss",
+  "number_format": "#,##,###.##",
+  "welcome_email_template": "Traces 360 registration",
+  "disable_standard_email_footer": 1
+ }
+]

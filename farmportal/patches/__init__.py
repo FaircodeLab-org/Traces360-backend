@@ -1,0 +1,2 @@
+"""Farmportal database patches."""
+

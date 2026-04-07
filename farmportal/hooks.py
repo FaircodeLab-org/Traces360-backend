@@ -10,7 +10,16 @@ fixtures = [
         "dt": "Custom Field",
         "filters": [
             ["dt", "in", ["Supplier", "Customer"]],
-            ["fieldname", "=", "custom_user"],
+            [
+                "fieldname",
+                "in",
+                [
+                    "custom_user",
+                    "custom_verification_status",
+                    "custom_section_break_9d28u",
+                    "custom_members",
+                ],
+            ],
         ],
     },
     {
@@ -21,14 +30,28 @@ fixtures = [
         "dt": "Item",
         "filters": [["item_group", "=", "EUDR Commodities"]],
     },
+    {
+        "dt": "Email Template",
+        "filters": [["name", "=", "Traces 360 registration"]],
+    },
+    {
+        "dt": "System Settings",
+        "filters": [["name", "=", "System Settings"]],
+    },
 ]
-
 # your_app/hooks.py
 doc_events = {
     "Supplier": {
         "validate": "farmportal.api.organization_profile.manage_organization_users"
+    },
+    "Customer": {
+        "validate": "farmportal.api.organization_profile.manage_organization_users"
     }
 }
+
+website_redirects = [
+    {"source": "/me", "target": "https://traces360.com", "redirect_http_status": 302}
+]
 
 
 # CORS Configuration - Add this section

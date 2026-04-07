@@ -34,7 +34,7 @@
    "in_list_view": 1,
    "label": "Plot ID",
    "reqd": 1,
-   "unique": 1
+   "unique": 0
   },
   {
    "fieldname": "farmer_name",

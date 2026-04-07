@@ -1,0 +1,10 @@
+[
+ {
+  "docstatus": 0,
+  "doctype": "Email Template",
+  "name": "Traces 360 registration",
+  "subject": "Welcome to Traces360 - Complete your account setup",
+  "use_html": 1,
+  "response_html": "<p>Hello {{ first_name | e }},</p>\n\n<p>Welcome to <strong>Traces360</strong>.</p>\n\n<p>Your account has been created successfully.</p>\n<p>Login ID: <strong>{{ user }}</strong></p>\n\n<p>Click below to set your password and activate your account:</p>\n\n<p style=\"margin: 16px 0;\">\n  <a href=\"{{ link }}\" style=\"background:#2E7D32;color:#ffffff;text-decoration:none;padding:10px 16px;border-radius:6px;display:inline-block;\">\n    Complete Account Setup\n  </a>\n</p>\n\n<p>If the button does not work, copy and paste this link into your browser:</p>\n<p><a href=\"{{ link }}\">{{ link }}</a></p>\n\n<p>Thank you,<br/>Team Traces360</p>"
+ }
+]
