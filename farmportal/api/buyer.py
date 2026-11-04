@@ -75,9 +75,6 @@ def create_buyer_with_user(buyer_name=None, email=None, buyer_code=None, company
             "phone": phone,
             "country": country,
         }
-        if country:
-            customer_data["country"] = country
-
         user_field = _get_buyer_user_field()
         if user_field:
             buyer_data[user_field] = user.name
@@ -119,10 +116,16 @@ def toggle_buyer_access(buyer_name, enable=0):
 
 
 @frappe.whitelist()
-def get_buyers(search=None, limit=100, page=1, page_size=None):
+def get_buyers(search=None, limit=100, page=1, page_size=None, country=None, access_status=None):
     user = frappe.session.user
     if user == "Guest":
         frappe.throw(_("Not logged in"), frappe.PermissionError)
+
+    from farmportal.api.requests import _get_party_from_user
+
+    _customer_name, supplier_name = _get_party_from_user(user)
+    if not supplier_name and "System Manager" not in frappe.get_roles(user):
+        frappe.throw(_("Only supplier users can browse buyers"), frappe.PermissionError)
 
     page_no = _coerce_page(page, default=1)
     page_limit = _coerce_page_size(page_size=page_size, fallback_limit=limit, default=25, max_size=100)
@@ -132,11 +135,11 @@ def get_buyers(search=None, limit=100, page=1, page_size=None):
     if not user_field:
         frappe.throw(_("Buyer doctype has no user link field (custom_user/user_id/user)"))
 
-    search_condition = ""
+    filter_conditions = []
     params = {}
     if search:
-        search_condition = """
-            AND (
+        filter_conditions.append("""
+            (
                 b.buyer_name LIKE %(search)s
                 OR b.name LIKE %(search)s
                 OR b.buyer_code LIKE %(search)s
@@ -144,8 +147,24 @@ def get_buyers(search=None, limit=100, page=1, page_size=None):
                 OR b.email LIKE %(search)s
                 OR u.email LIKE %(search)s
             )
-        """
+        """)
         params["search"] = f"%{search}%"
+
+    country = str(country or "").strip()
+    if country:
+        filter_conditions.append("b.country = %(country)s")
+        params["country"] = country
+
+    access_status = str(access_status or "").strip().lower()
+    if access_status:
+        if access_status not in {"active", "disabled"}:
+            frappe.throw(_("Invalid access status"))
+        filter_conditions.append("COALESCE(u.enabled, 0) = %(user_enabled)s")
+        params["user_enabled"] = 1 if access_status == "active" else 0
+
+    filter_sql = ""
+    if filter_conditions:
+        filter_sql = " AND " + " AND ".join(f"({condition.strip()})" for condition in filter_conditions)
 
     base_from_where = f"""
         SELECT 
@@ -163,7 +182,7 @@ def get_buyers(search=None, limit=100, page=1, page_size=None):
         WHERE 
             b.{user_field} IS NOT NULL 
             AND b.{user_field} != ''
-            {search_condition}
+            {filter_sql}
     """
 
     count_query = f"""
@@ -173,7 +192,7 @@ def get_buyers(search=None, limit=100, page=1, page_size=None):
         WHERE 
             b.{user_field} IS NOT NULL 
             AND b.{user_field} != ''
-            {search_condition}
+            {filter_sql}
     """
     total_row = frappe.db.sql(count_query, params, as_dict=True) or []
     total = int((total_row[0] or {}).get("total") or 0)
@@ -186,6 +205,19 @@ def get_buyers(search=None, limit=100, page=1, page_size=None):
     """
 
     data = frappe.db.sql(query, params, as_dict=True)
+
+    country_rows = frappe.db.sql(
+        f"""
+        SELECT DISTINCT b.country
+        FROM `tabBuyer` b
+        JOIN `tabUser` u ON b.{user_field} = u.name
+        WHERE b.{user_field} IS NOT NULL
+          AND b.{user_field} != ''
+          AND COALESCE(b.country, '') != ''
+        ORDER BY b.country ASC
+        """,
+        as_dict=True,
+    )
 
     buyers = [
         {
@@ -206,4 +238,8 @@ def get_buyers(search=None, limit=100, page=1, page_size=None):
     return {
         "buyers": buyers,
         "pagination": _build_pagination(page_no, page_limit, total),
+        "filter_options": {
+            "countries": [row.get("country") for row in country_rows if row.get("country")],
+            "access_statuses": ["Active", "Disabled"],
+        },
     }

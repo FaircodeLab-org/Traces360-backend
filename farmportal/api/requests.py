@@ -3,7 +3,7 @@
 import json
 import frappe
 from frappe import _
-from frappe.utils import now_datetime, get_datetime
+from frappe.utils import now_datetime, get_datetime, getdate
 from urllib.parse import urlparse
 from farmportal.api.organization_profile import (
     _get_customer_permission_context,
@@ -114,6 +114,75 @@ def _parse_status_filters(status):
             seen.add(canonical)
             values.append(canonical)
     return values
+
+
+def _parse_request_list_date(value, label):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return getdate(text)
+    except Exception:
+        frappe.throw(_("Invalid {0}").format(label))
+
+
+def _build_request_list_filters(
+    party_field,
+    party,
+    status=None,
+    search=None,
+    request_type=None,
+    date_from=None,
+    date_to=None,
+):
+    filters = {party_field: party}
+
+    status_values = _parse_status_filters(status)
+    if status_values:
+        filters["status"] = ["in", status_values]
+
+    request_type_value = str(request_type or "").strip().lower()
+    if request_type_value and request_type_value not in ("all", "*"):
+        if request_type_value not in ("land_plot", "purchase_order"):
+            frappe.throw(_("Invalid request type"))
+        filters["request_type"] = request_type_value
+
+    start_date = _parse_request_list_date(date_from, _("start date"))
+    end_date = _parse_request_list_date(date_to, _("end date"))
+    if start_date and end_date and start_date > end_date:
+        frappe.throw(_("End date must be on or after start date"))
+    if start_date and end_date:
+        filters["creation"] = [
+            "between",
+            [f"{start_date} 00:00:00", f"{end_date} 23:59:59.999999"],
+        ]
+    elif start_date:
+        filters["creation"] = [">=", f"{start_date} 00:00:00"]
+    elif end_date:
+        filters["creation"] = ["<=", f"{end_date} 23:59:59.999999"]
+
+    search_value = str(search or "").strip().lstrip("#")
+    or_filters = None
+    if search_value:
+        like_value = f"%{search_value}%"
+        related_party_field = "supplier" if party_field == "customer" else "customer"
+        or_filters = [
+            [DT, "name", "like", like_value],
+            [DT, related_party_field, "like", like_value],
+            [DT, "purchase_order_number", "like", like_value],
+        ]
+
+    return filters, or_filters
+
+
+def _count_request_list(filters, or_filters=None):
+    rows = frappe.get_all(
+        DT,
+        filters=filters,
+        or_filters=or_filters,
+        fields=["count(name) as total"],
+    )
+    return int((rows[0] or {}).get("total") or 0) if rows else 0
 
 
 def _risk_cache_keys(customer: str) -> dict:
@@ -564,7 +633,15 @@ def _get_party_from_user(user: str) -> tuple[str | None, str | None]:
 #         return {"requests": []}
 
 @frappe.whitelist()
-def get_customer_requests(page=1, page_size=25, status=None):
+def get_customer_requests(
+    page=1,
+    page_size=25,
+    status=None,
+    search=None,
+    request_type=None,
+    date_from=None,
+    date_to=None,
+):
     """Get all requests for the current customer"""
     user = frappe.session.user
     if user == "Guest":
@@ -580,15 +657,20 @@ def get_customer_requests(page=1, page_size=25, status=None):
         page_len = _coerce_page_size(page_size, default=25, max_size=100)
         offset = (page_no - 1) * page_len
 
-        filters = {"customer": customer}
-        status_values = _parse_status_filters(status)
-        if status_values:
-            filters["status"] = ["in", status_values]
-
-        total = int(frappe.db.count("Request", filters=filters) or 0)
+        filters, or_filters = _build_request_list_filters(
+            "customer",
+            customer,
+            status=status,
+            search=search,
+            request_type=request_type,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        total = _count_request_list(filters, or_filters=or_filters)
 
         requests = frappe.get_all("Request", 
             filters=filters,
+            or_filters=or_filters,
             fields=[
                 "name", "customer", "supplier", "request_type", "status", 
                 "creation", "response_message", "shared_plots_json", 
@@ -613,7 +695,15 @@ def get_customer_requests(page=1, page_size=25, status=None):
 
 
 @frappe.whitelist()
-def get_supplier_requests(page=1, page_size=25, status=None):
+def get_supplier_requests(
+    page=1,
+    page_size=25,
+    status=None,
+    search=None,
+    request_type=None,
+    date_from=None,
+    date_to=None,
+):
     """Get all requests for the current supplier"""
     user = frappe.session.user
     if user == "Guest":
@@ -629,15 +719,20 @@ def get_supplier_requests(page=1, page_size=25, status=None):
         page_len = _coerce_page_size(page_size, default=25, max_size=100)
         offset = (page_no - 1) * page_len
 
-        filters = {"supplier": supplier}
-        status_values = _parse_status_filters(status)
-        if status_values:
-            filters["status"] = ["in", status_values]
-
-        total = int(frappe.db.count("Request", filters=filters) or 0)
+        filters, or_filters = _build_request_list_filters(
+            "supplier",
+            supplier,
+            status=status,
+            search=search,
+            request_type=request_type,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        total = _count_request_list(filters, or_filters=or_filters)
 
         requests = frappe.get_all("Request", 
             filters=filters,
+            or_filters=or_filters,
             fields=[
                 "name", "customer", "supplier", "request_type", "status", 
                 "creation", "response_message", "shared_plots_json", 

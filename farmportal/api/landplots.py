@@ -809,9 +809,34 @@ def _get_party_from_user(user):
     supplier = _link_by_user_field("Supplier", user) or _link_by_contact_email(user, "Supplier")
     return customer, supplier
 
+def _coerce_land_plot_page(value, default=1):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return parsed if parsed > 0 else default
+
+
+def _coerce_land_plot_page_size(value, default=25, max_size=1000):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if parsed <= 0:
+        parsed = default
+    return min(parsed, max_size)
+
+
 @frappe.whitelist()
-def get_land_plots():
-    """Get all land plots for the logged-in supplier"""
+def get_land_plots(
+    page=None,
+    page_size=None,
+    search=None,
+    country=None,
+    state_province=None,
+    commodity=None,
+):
+    """Get supplier plots, optionally filtered and paginated for table views."""
     user = frappe.session.user
     if user == "Guest":
         frappe.throw(_("Not logged in"), frappe.PermissionError)
@@ -819,16 +844,75 @@ def get_land_plots():
     customer, supplier = _get_party_from_user(user)
     if not supplier:
         frappe.throw(_("Only Suppliers can access land plots"), frappe.PermissionError)
+    _require_supplier_permission(
+        user,
+        SUPPLIER_PERMISSION_PLOT_MANAGER,
+        supplier_hint=supplier,
+        message=_("You are not allowed to access land plots"),
+    )
+
+    filters = {"supplier": supplier}
+    country_value = str(country or "").strip()
+    state_value = str(state_province or "").strip()
+    commodity_value = str(commodity or "").strip()
+    if country_value:
+        filters["country"] = country_value
+    if state_value:
+        filters["state_province"] = state_value
+    if commodity_value:
+        filters["commodities"] = ["like", f"%{commodity_value}%"]
+
+    search_value = str(search or "").strip()
+    or_filters = None
+    if search_value:
+        like_value = f"%{search_value}%"
+        or_filters = [
+            ["Land Plot", "name", "like", like_value],
+            ["Land Plot", "plot_id", "like", like_value],
+            ["Land Plot", "farmer_name", "like", like_value],
+        ]
+
+    paginated = page is not None or page_size is not None
+    page_no = _coerce_land_plot_page(page, default=1)
+    page_len = _coerce_land_plot_page_size(page_size, default=25, max_size=1000)
+    query_limits = {}
+    total = None
+    if paginated:
+        count_rows = frappe.get_all(
+            "Land Plot",
+            filters=filters,
+            or_filters=or_filters,
+            fields=["count(name) as total"],
+        )
+        total = int((count_rows[0] or {}).get("total") or 0) if count_rows else 0
+        query_limits = {
+            "limit_start": (page_no - 1) * page_len,
+            "limit_page_length": page_len,
+        }
 
     plots = frappe.get_all("Land Plot", 
-        filters={"supplier": supplier},
+        filters=filters,
+        or_filters=or_filters,
         fields=[
             "name", "plot_id", "farmer_name", "state_province", "country", "area", "yield_dried_mt",
             "coordinates", "geojson", "latitude", "longitude",
             "commodities", "deforestation_percentage", "deforested_area",
             "deforested_polygons"
-        ]
+        ],
+        order_by="modified desc",
+        **query_limits,
     )
+
+    products_by_plot = {}
+    plot_names = [plot.name for plot in plots if plot.get("name")]
+    if plot_names:
+        product_rows = frappe.get_all(
+            "Land Plot Product",
+            filters={"parent": ["in", plot_names]},
+            fields=["parent", "product", "product_name"],
+        )
+        for product in product_rows:
+            products_by_plot.setdefault(product.parent, []).append(product.product)
     
     # Parse JSON fields and add products
     for plot in plots:
@@ -842,12 +926,7 @@ def get_land_plots():
         except:
             pass
             
-        # Get products
-        products = frappe.get_all("Land Plot Product",
-            filters={"parent": plot.name},
-            fields=["product", "product_name"]
-        )
-        plot.products = [p.product for p in products]
+        plot.products = products_by_plot.get(plot.name, [])
         
         # Parse commodities 
         if plot.commodities:
@@ -855,7 +934,19 @@ def get_land_plots():
         else:
             plot.commodities = []
     
-    return {"data": plots}
+    if total is None:
+        total = len(plots)
+
+    total_pages = (total + page_len - 1) // page_len if paginated and page_len else (1 if total else 0)
+    return {
+        "data": plots,
+        "pagination": {
+            "page": page_no,
+            "page_size": page_len if paginated else total,
+            "total": total,
+            "total_pages": total_pages,
+        },
+    }
 
 def create_single_plot_internal(plot_data, supplier, calculate_deforestation=True):
     """Internal function to create a single plot with proper unique ID generation"""

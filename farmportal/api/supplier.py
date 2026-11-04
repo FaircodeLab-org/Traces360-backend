@@ -228,13 +228,27 @@ def toggle_supplier_access(supplier_name, enable=0):
 
 
 @frappe.whitelist()
-def get_suppliers(search=None, limit=100, page=1, page_size=None):
+def get_suppliers(
+    search=None,
+    limit=100,
+    page=1,
+    page_size=None,
+    country=None,
+    verification_status=None,
+    access_status=None,
+):
     """
     Get suppliers linked to a User, including their email and enabled status.
     """
     user = frappe.session.user
     if user == "Guest":
         frappe.throw(_("Not logged in"), frappe.PermissionError)
+
+    from farmportal.api.requests import _get_party_from_user
+
+    customer_name, _supplier_name = _get_party_from_user(user)
+    if not customer_name and "System Manager" not in frappe.get_roles(user):
+        frappe.throw(_("Only importer users can browse suppliers"), frappe.PermissionError)
 
     page_no = _coerce_page(page, default=1)
     page_limit = _coerce_page_size(page_size=page_size, fallback_limit=limit, default=25, max_size=100)
@@ -245,19 +259,45 @@ def get_suppliers(search=None, limit=100, page=1, page_size=None):
         if verification_field
         else ", 'Pending' as verification_status"
     )
+    verification_expression = (
+        f"COALESCE(NULLIF(s.`{verification_field}`, ''), 'Pending')"
+        if verification_field
+        else "'Pending'"
+    )
 
-    # Prepare search condition
-    search_condition = ""
+    # Keep filters in the shared WHERE clause so rows and pagination totals match.
+    filter_conditions = []
     params = {}
     if search:
-        search_condition = """
-            AND (
+        filter_conditions.append("""
+            (
                 s.supplier_name LIKE %(search)s 
                 OR s.name LIKE %(search)s
                 OR u.email LIKE %(search)s
             )
-        """
+        """)
         params["search"] = f"%{search}%"
+
+    country = str(country or "").strip()
+    if country:
+        filter_conditions.append("s.country = %(country)s")
+        params["country"] = country
+
+    verification_status = _normalize_verification_status(verification_status) if verification_status else ""
+    if verification_status:
+        filter_conditions.append(f"LOWER({verification_expression}) = %(verification_status)s")
+        params["verification_status"] = verification_status.lower()
+
+    access_status = str(access_status or "").strip().lower()
+    if access_status:
+        if access_status not in {"active", "disabled"}:
+            frappe.throw(_("Invalid access status"))
+        filter_conditions.append("COALESCE(u.enabled, 0) = %(user_enabled)s")
+        params["user_enabled"] = 1 if access_status == "active" else 0
+
+    filter_sql = ""
+    if filter_conditions:
+        filter_sql = " AND " + " AND ".join(f"({condition.strip()})" for condition in filter_conditions)
 
     # SQL Query with Join to get User details (email, enabled status)
     # We filter by s.disabled = 0 (Supplier doctype status)
@@ -277,7 +317,7 @@ def get_suppliers(search=None, limit=100, page=1, page_size=None):
             s.disabled = 0
             AND s.custom_user IS NOT NULL 
             AND s.custom_user != ''
-            {search_condition}
+            {filter_sql}
     """
 
     count_query = f"""
@@ -288,7 +328,7 @@ def get_suppliers(search=None, limit=100, page=1, page_size=None):
             s.disabled = 0
             AND s.custom_user IS NOT NULL 
             AND s.custom_user != ''
-            {search_condition}
+            {filter_sql}
     """
     total_row = frappe.db.sql(count_query, params, as_dict=True) or []
     total = int((total_row[0] or {}).get("total") or 0)
@@ -301,6 +341,20 @@ def get_suppliers(search=None, limit=100, page=1, page_size=None):
     """
 
     data = frappe.db.sql(query, params, as_dict=True)
+
+    country_rows = frappe.db.sql(
+        """
+        SELECT DISTINCT s.country
+        FROM `tabSupplier` s
+        JOIN `tabUser` u ON s.custom_user = u.name
+        WHERE s.disabled = 0
+          AND s.custom_user IS NOT NULL
+          AND s.custom_user != ''
+          AND COALESCE(s.country, '') != ''
+        ORDER BY s.country ASC
+        """,
+        as_dict=True,
+    )
 
     supplier_names = [str(row.get("name") or "").strip() for row in data if row.get("name")]
     supplier_labels = [str(row.get("supplier_name") or row.get("name") or "").strip() for row in data if row.get("name")]
@@ -478,6 +532,11 @@ def get_suppliers(search=None, limit=100, page=1, page_size=None):
     return {
         "suppliers": suppliers,
         "pagination": _build_pagination(page_no, page_limit, total),
+        "filter_options": {
+            "countries": [row.get("country") for row in country_rows if row.get("country")],
+            "verification_statuses": ["Pending", "Verified", "Rejected"],
+            "access_statuses": ["Active", "Disabled"],
+        },
     }
 
 

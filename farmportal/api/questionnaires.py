@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import frappe
 from frappe import _ as _t
+from frappe.utils import add_days, getdate, nowdate
 from frappe.utils.file_manager import save_file
 from farmportal.api.organization_profile import (
     _get_customer_permission_context,
@@ -255,8 +256,6 @@ def _serialize_question_row(row) -> dict:
 def _ensure_template_access(doc, customer: str | None, is_manager: bool):
     if is_manager:
         return
-    if int(doc.get("is_public") or 0):
-        return
     if customer and doc.get("customer") == customer:
         return
     frappe.throw(_t("Not permitted to access this template"), frappe.PermissionError)
@@ -367,8 +366,25 @@ def create_questionnaire(supplier_id: str = None, title: str = None, questions: 
     return {"id": doc.name, "status": doc.status, "message": _t("Questionnaire created successfully")}
 
 
+def _parse_questionnaire_date(value, label):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return getdate(text)
+    except Exception:
+        frappe.throw(_t("Invalid {0}").format(label))
+
+
 @frappe.whitelist()
-def list_for_me(status: str | None = None, page=1, page_size=25):
+def list_for_me(
+    status: str | None = None,
+    page=1,
+    page_size=25,
+    search=None,
+    due_from=None,
+    due_to=None,
+):
     """
     List questionnaires for the logged-in user.
     
@@ -412,18 +428,56 @@ def list_for_me(status: str | None = None, page=1, page_size=25):
     else:
         return {"items": [], "role": None}
 
-    if status:
-        filters["status"] = status
+    status_value = str(status or "").strip()
+    overdue = status_value.lower() == "overdue"
+    if overdue:
+        filters["status"] = "Pending"
+    elif status_value and status_value.lower() not in ("all", "*"):
+        if status_value.lower() not in ("pending", "completed", "denied"):
+            frappe.throw(_t("Invalid questionnaire status"))
+        filters["status"] = status_value[:1].upper() + status_value[1:].lower()
+
+    start_date = _parse_questionnaire_date(due_from, _t("start date"))
+    end_date = _parse_questionnaire_date(due_to, _t("end date"))
+    if overdue:
+        overdue_end = getdate(add_days(nowdate(), -1))
+        end_date = min(end_date, overdue_end) if end_date else overdue_end
+    if start_date and end_date and start_date > end_date:
+        frappe.throw(_t("End date must be on or after start date"))
+    if start_date and end_date:
+        filters["due_date"] = ["between", [start_date, end_date]]
+    elif start_date:
+        filters["due_date"] = [">=", start_date]
+    elif end_date:
+        filters["due_date"] = ["<=", end_date]
+
+    search_value = str(search or "").strip()
+    or_filters = None
+    if search_value:
+        like_value = f"%{search_value}%"
+        related_party_field = "supplier" if role == "customer" else "customer"
+        or_filters = [
+            [DT, "name", "like", like_value],
+            [DT, "title", "like", like_value],
+            [DT, related_party_field, "like", like_value],
+        ]
 
     page_no = _coerce_page(page, default=1)
     page_len = _coerce_page_size(page_size, default=25, max_size=100)
     offset = (page_no - 1) * page_len
 
-    total = int(frappe.db.count(DT, filters=filters) or 0)
+    total_rows = frappe.get_all(
+        DT,
+        filters=filters,
+        or_filters=or_filters,
+        fields=["count(name) as total"],
+    )
+    total = int((total_rows[0] or {}).get("total") or 0) if total_rows else 0
 
     rows = frappe.get_all(
         DT,
         filters=filters,
+        or_filters=or_filters,
         fields=[
             "name as id", "title", "customer", "supplier", "status",
             "due_date", "creation", "modified", "responded_by", "submitted_on"
@@ -450,7 +504,7 @@ def list_for_me(status: str | None = None, page=1, page_size=25):
 
 
 @frappe.whitelist()
-def list_templates(page=1, page_size=25):
+def list_templates(page=1, page_size=25, search=None):
     user = frappe.session.user
     if user == "Guest":
         frappe.throw(_t("Not logged in"), frappe.PermissionError)
@@ -470,16 +524,23 @@ def list_templates(page=1, page_size=25):
     offset = (page_no - 1) * page_len
 
     filters = {"is_active": 1}
-    or_filters = None
-
     if not is_manager:
-        if customer:
-            or_filters = [
-                [TEMPLATE_DT, "is_public", "=", 1],
-                [TEMPLATE_DT, "customer", "=", customer],
-            ]
-        else:
-            filters["is_public"] = 1
+        if not customer:
+            return {
+                "items": [],
+                "pagination": _build_pagination(page_no, page_len, 0),
+            }
+        filters["customer"] = customer
+
+    search_text = str(search or "").strip()
+    or_filters = None
+    if search_text:
+        search_value = f"%{search_text}%"
+        or_filters = [
+            [TEMPLATE_DT, "name", "like", search_value],
+            [TEMPLATE_DT, "title", "like", search_value],
+            [TEMPLATE_DT, "description", "like", search_value],
+        ]
 
     total_rows = frappe.get_all(
         TEMPLATE_DT,
@@ -624,7 +685,8 @@ def save_template(
 
     doc.title = normalized_title
     doc.description = (description or "").strip()
-    doc.is_public = 1 if _parse_bool(is_public, default=False) else 0
+    # Templates are tenant-owned; public templates are intentionally disabled.
+    doc.is_public = 0
     doc.is_active = 1
     doc.set("questions", [])
     _append_question_rows(doc, qlist, table_field="questions")
@@ -637,6 +699,36 @@ def save_template(
     frappe.db.commit()
 
     return {"id": doc.name, "message": _t("Template saved successfully")}
+
+
+@frappe.whitelist()
+def delete_template(template_id: str = None, **kwargs):
+    user = frappe.session.user
+    if user == "Guest":
+        frappe.throw(_t("Not logged in"), frappe.PermissionError)
+
+    payload = _parse_payload(kwargs)
+    template_id = template_id or payload.get("template_id") or payload.get("id")
+    if not template_id:
+        frappe.throw(_t("Template ID is required"))
+
+    customer = _resolve_customer_for_user(user)
+    is_manager = _is_system_manager(user)
+    if not customer and not is_manager:
+        frappe.throw(_t("Only importer/customer users can manage templates"), frappe.PermissionError)
+    if customer and not is_manager:
+        _require_customer_permission(
+            user,
+            SUPPLIER_PERMISSION_QUESTIONNAIRE_MANAGER,
+            customer_hint=customer,
+            message=_t("You are not allowed to manage questionnaire templates"),
+        )
+
+    doc = frappe.get_doc(TEMPLATE_DT, template_id)
+    _ensure_template_access(doc, customer, is_manager)
+    frappe.delete_doc(TEMPLATE_DT, template_id, ignore_permissions=True)
+    frappe.db.commit()
+    return {"message": _t("Template deleted successfully")}
 
 
 @frappe.whitelist()

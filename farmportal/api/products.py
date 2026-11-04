@@ -46,8 +46,27 @@ def _build_meta(limit_start, limit_page_length, total, returned):
     }
 
 
+def _get_item_filter_options(filters):
+    rows = frappe.get_all(
+        "Item",
+        filters=filters,
+        fields=["item_group", "stock_uom"],
+        limit_page_length=5000,
+    )
+    return {
+        "item_groups": sorted({row.get("item_group") for row in rows if row.get("item_group")}),
+        "stock_uoms": sorted({row.get("stock_uom") for row in rows if row.get("stock_uom")}),
+    }
+
+
 @frappe.whitelist()
-def get_products(search: str = None, limit_start: int = 0, limit_page_length: int = 200):
+def get_products(
+    search: str = None,
+    item_group: str = None,
+    stock_uom: str = None,
+    limit_start: int = 0,
+    limit_page_length: int = 200,
+):
     """
     Returns Items linked to Request.requested_products for the current user
     (customer or supplier), with a batches array for each item.
@@ -65,7 +84,13 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
 
     # Importer side: show all EUDR Commodities items
     if customer and not supplier:
-        filters = {"item_group": "EUDR Commodities", "disabled": 0}
+        base_filters = {"item_group": "EUDR Commodities", "disabled": 0}
+        filter_options = _get_item_filter_options(base_filters)
+        filters = dict(base_filters)
+        if item_group and str(item_group).strip().casefold() != "EUDR Commodities".casefold():
+            frappe.throw("Invalid product category")
+        if stock_uom:
+            filters["stock_uom"] = str(stock_uom).strip()
         or_filters = None
         if search:
             like = f"%{search}%"
@@ -109,10 +134,12 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
         for it in items:
             it["batches"] = batches_by_item.get(it.get("name")) or batches_by_item.get(it.get("item_code"), [])
 
+        meta = _build_meta(limit_start, limit_page_length, total, len(items))
+        meta["filter_options"] = filter_options
         return {
             "message": f"Fetched {len(items)} EUDR Commodities products",
             "data": items,
-            "meta": _build_meta(limit_start, limit_page_length, total, len(items)),
+            "meta": meta,
         }
 
     req_filters = {}
@@ -175,7 +202,13 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
 
     requested_ids = list(requested_ids)
 
-    filters = {"name": ["in", requested_ids], "disabled": 0}
+    base_filters = {"name": ["in", requested_ids], "disabled": 0}
+    filter_options = _get_item_filter_options(base_filters)
+    filters = dict(base_filters)
+    if item_group:
+        filters["item_group"] = str(item_group).strip()
+    if stock_uom:
+        filters["stock_uom"] = str(stock_uom).strip()
     or_filters = None
     if search:
         like = f"%{search}%"
@@ -221,8 +254,10 @@ def get_products(search: str = None, limit_start: int = 0, limit_page_length: in
     for it in items:
         it["batches"] = batches_by_item.get(it.get("name")) or batches_by_item.get(it.get("item_code"), [])
 
+    meta = _build_meta(limit_start, limit_page_length, total, len(items))
+    meta["filter_options"] = filter_options
     return {
         "message": f"Fetched {len(items)} requested products",
         "data": items,
-        "meta": _build_meta(limit_start, limit_page_length, total, len(items)),
+        "meta": meta,
     }

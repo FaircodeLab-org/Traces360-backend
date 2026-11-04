@@ -62,7 +62,6 @@ override_whitelisted_methods = {
     "farmportal.custom_api.get_current_user": "farmportal.custom_api.get_current_user"
 }
 
-
 # # Allow CORS for specific origins
 # allow_cors_origins = ["https://farm-portal-2cpb.vercel.app"]
 
